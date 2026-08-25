@@ -1,0 +1,17 @@
+# Local config and secrets
+.env
+.env.*
+
+# Runtime state and purchase evidence
+*.state
+logs/
+proofs/
+
+# Bundled payer binaries
+phoenixd-*/
+
+# Pre-edit copies left beside edited files
+*.bak-*
+
+# macOS
+.DS_Store

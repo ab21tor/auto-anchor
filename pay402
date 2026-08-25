@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# pay402 — automatic L402 payer (client side).
+# Usage: pay402 <64-hex-digest>
+# Env: GATEWAY_URL (required), MAX_PRICE_SATS (default 5000),
+#      PHOENIXD_URL (default http://127.0.0.1:9740), PROOF_DIR (default ~/auto-anchor/proofs)
+set -euo pipefail
+
+DIGEST="${1:?usage: pay402 <64-hex sha256 digest>}"
+[[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "pay402: digest must be 64 lowercase hex chars" >&2; exit 2; }
+: "${GATEWAY_URL:?set GATEWAY_URL, e.g. http://127.0.0.1:8000}"
+GATEWAY_URL="${GATEWAY_URL%/}"   # tolerate a trailing slash — //timestamp 404s on strict servers
+MAX_PRICE_SATS="${MAX_PRICE_SATS:-5000}"
+PHOENIXD_URL="${PHOENIXD_URL:-http://127.0.0.1:9740}"
+PROOF_DIR="${PROOF_DIR:-$HOME/auto-anchor/proofs}"
+mkdir -p "$PROOF_DIR"
+
+PW=$(sed -n 's/^http-password=//p' "$HOME/.phoenix/phoenix.conf" | head -1)
+[ -n "$PW" ] || { echo "pay402: no http-password in ~/.phoenix/phoenix.conf" >&2; exit 2; }
+
+# 1. Challenge
+CH=$(curl -s -D - -o /dev/null -X POST "$GATEWAY_URL/timestamp" -H 'Content-Type: application/json' -d "{\"digest\":\"$DIGEST\"}")
+AUTH=$(printf '%s' "$CH" | tr -d '\r' | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: L402 //p')
+MACAROON=$(printf '%s' "$AUTH" | sed -n 's/.*macaroon="\([^"]*\)".*/\1/p')
+INVOICE=$(printf '%s' "$AUTH" | sed -n 's/.*invoice="\([^"]*\)".*/\1/p')
+[ -n "$MACAROON" ] && [ -n "$INVOICE" ] || { echo "pay402: no L402 challenge in response" >&2; printf '%s\n' "$CH" >&2; exit 3; }
+
+# 2. Ceiling — fail closed if the amount can't be read
+AMT=$(curl -s --config - 2>/dev/null <<EOF | python3 -c 'import sys,json;d=json.load(sys.stdin);a=d.get("amountSat") or (int(d.get("amount",0))//1000 if d.get("amount") else None) or (int(d.get("amountMsat",0))//1000 if d.get("amountMsat") else None);print(a if a else "")' 2>/dev/null
+url = "$PHOENIXD_URL/decodeinvoice"
+user = ":$PW"
+data = "invoice=$INVOICE"
+EOF
+)
+[ -n "$AMT" ] || { echo "pay402: cannot determine invoice amount — refusing to pay (fail closed)" >&2; exit 4; }
+[ "$AMT" -le "$MAX_PRICE_SATS" ] || { echo "pay402: quote ${AMT} sat exceeds ceiling ${MAX_PRICE_SATS} — refusing" >&2; exit 5; }
+
+# 3. Pay
+PREIMAGE=$(curl -s --config - 2>/dev/null <<EOF | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("paymentPreimage",""))'
+url = "$PHOENIXD_URL/payinvoice"
+user = ":$PW"
+data = "invoice=$INVOICE"
+EOF
+)
+[ -n "$PREIMAGE" ] || { echo "pay402: payment did not return a preimage" >&2; exit 6; }
+
+# 4. Redeem
+OUT="$PROOF_DIR/$DIGEST.ots"
+CODE=$(curl -s -o "$OUT" -w '%{http_code}' --config - 2>/dev/null <<EOF
+url = "$GATEWAY_URL/timestamp"
+header = "Content-Type: application/json"
+header = "Authorization: L402 $MACAROON:$PREIMAGE"
+data = "{\"digest\":\"$DIGEST\"}"
+EOF
+)
+[ "$CODE" = "200" ] && [ -s "$OUT" ] || { echo "pay402: redeem failed (HTTP $CODE)" >&2; exit 7; }
+echo "paid ${AMT} sat -> $OUT"
