@@ -19,15 +19,34 @@
 #   AUDIT_PER_RECORD_SATS (optional) contracted per-record rate. When set,
 #                        every unpaid bill must carry an integer records >= 1
 #                        and satisfy amount_sats == records x rate, checked
-#                        before any phoenixd contact for the bill; a failing
-#                        bill is skipped (records_missing | rate_mismatch)
-#                        and the run ends needs_attention. Unset: no audit.
+#                        in exact integer arithmetic before any phoenixd
+#                        contact for the bill; a failing bill is skipped
+#                        (records_missing | rate_mismatch) and the run ends
+#                        needs_attention. Unset: no rate audit.
+#   MAX_RECORDS_PER_BILL (default 10000000) plausibility bound: a bill
+#                        claiming more records than this, or an amount above
+#                        the total bitcoin supply, is refused (implausible)
+#                        whatever its arithmetic says, and the run ends
+#                        needs_attention. Size it like the ceilings: records
+#                        per anchor window, with room.
 #   DRY_RUN              (strict true/false, default true)
 #   STATE_FILE           (default pay-anchor-bills.state beside this script)
 #
 # The budget counts ATTEMPTS, not confirmed successes: spend is recorded
 # before each /payinvoice call and never refunded intra-day — a timeout
 # mid-payment may still have paid (fail closed).
+#
+# The state file is the day line ("<UTC day> <sats spent>") followed by the
+# paid-txid ledger: one "paid <txid> <sats> <utc>" line per anchor this
+# payer has ever paid, appended the moment a preimage is in hand. A bill
+# whose txid is in the ledger is never paid again, whatever invoice it
+# carries now (already_paid_txid): a re-served anchor is a gateway defect or
+# a restored gateway ledger, never a new debt. A day line dated after today,
+# or any other line shape, is corruption and ends the run before any payment.
+#
+# No arithmetic is done in the shell on a number the gateway sent: the rate
+# audit and the plausibility bound run in Python on exact integers, and the
+# shell compares only amounts it has bounded to 16 digits.
 #
 # Secrets (ANCHOR_BILLS_TOKEN, phoenixd password) go to curl via stdin
 # config only — never argv, never echoed, never logged; curl stderr is
@@ -51,6 +70,7 @@ ENV_PHOENIXD_URL="${PHOENIXD_URL:-}"
 ENV_MAX_SATS_PER_BILL="${MAX_SATS_PER_BILL:-}"
 ENV_DAILY_BUDGET_SATS="${DAILY_BUDGET_SATS:-}"
 ENV_AUDIT_PER_RECORD_SATS="${AUDIT_PER_RECORD_SATS:-}"
+ENV_MAX_RECORDS_PER_BILL="${MAX_RECORDS_PER_BILL:-}"
 ENV_DRY_RUN="${DRY_RUN:-}"
 ENV_STATE_FILE="${STATE_FILE:-}"
 
@@ -67,6 +87,7 @@ PHOENIXD_URL="${ENV_PHOENIXD_URL:-${PHOENIXD_URL:-http://127.0.0.1:9740}}"
 MAX_SATS_PER_BILL="${ENV_MAX_SATS_PER_BILL:-${MAX_SATS_PER_BILL:-60000}}"
 DAILY_BUDGET_SATS="${ENV_DAILY_BUDGET_SATS:-${DAILY_BUDGET_SATS:-200000}}"
 AUDIT_PER_RECORD_SATS="${ENV_AUDIT_PER_RECORD_SATS:-${AUDIT_PER_RECORD_SATS:-}}"
+MAX_RECORDS_PER_BILL="${ENV_MAX_RECORDS_PER_BILL:-${MAX_RECORDS_PER_BILL:-10000000}}"
 DRY_RUN="${ENV_DRY_RUN:-${DRY_RUN:-true}}"
 STATE_FILE="${ENV_STATE_FILE:-${STATE_FILE:-$SCRIPT_DIR/pay-anchor-bills.state}}"
 
@@ -92,6 +113,15 @@ case "$AUDIT_PER_RECORD_SATS" in
   '') ;;
   0*|*[!0-9]*) fail_config "AUDIT_PER_RECORD_SATS must be a positive integer" ;;
 esac
+case "$MAX_RECORDS_PER_BILL" in
+  ''|0*|*[!0-9]*) fail_config "MAX_RECORDS_PER_BILL must be a positive integer" ;;
+esac
+# Every knob that reaches shell arithmetic is bounded to 16 digits (above
+# the total bitcoin supply in sats): the shell's integers are 64-bit, and
+# its comparisons fail open on anything larger.
+for KNOB in "$MAX_SATS_PER_BILL" "$DAILY_BUDGET_SATS" "$MAX_RECORDS_PER_BILL" "${AUDIT_PER_RECORD_SATS:-0}"; do
+  [ "${#KNOB}" -le 16 ] || fail_config "a sats or records knob exceeds 16 digits"
+done
 case "$DRY_RUN" in
   true|false) ;;
   *) fail_config "DRY_RUN must be true or false" ;;
@@ -104,6 +134,8 @@ PW=$(sed -n 's/^http-password=//p' "$HOME/.phoenix/phoenix.conf" | head -1)
 # acceptable: a corrupt file must not silently reset the budget to zero.
 TODAY="$(date -u +%Y-%m-%d)"
 SPENT_TODAY=0
+PAID_LEDGER=""
+PAID_TXIDS=""
 if [ -s "$STATE_FILE" ]; then
   read -r STATE_DAY STATE_SPENT < "$STATE_FILE"
   case "$STATE_DAY" in
@@ -113,20 +145,36 @@ if [ -s "$STATE_FILE" ]; then
   case "${STATE_SPENT:-}" in
     ''|*[!0-9]*) fail_config "state file unreadable" ;;
   esac
+  [ "${#STATE_SPENT}" -le 16 ] || fail_config "state file unreadable"
+  # A day line dated after today is not a fresh day: the file was tampered
+  # with or the clock moved, and the budget must not silently restart.
+  [ "$STATE_DAY" \> "$TODAY" ] && fail_config "state file dated in the future"
   [ "$STATE_DAY" = "$TODAY" ] && SPENT_TODAY="$STATE_SPENT"
+  # Every later line is the paid-txid ledger. Any other shape is corruption.
+  while IFS=' ' read -r KIND LTXID LSATS LWHEN; do
+    [ -n "$KIND" ] || continue
+    [ "$KIND" = "paid" ] || fail_config "state file unreadable"
+    case "$LTXID" in ''|*[!0-9a-f]*) fail_config "state file unreadable" ;; esac
+    PAID_TXIDS="$PAID_TXIDS $LTXID"
+    PAID_LEDGER="${PAID_LEDGER}paid $LTXID $LSATS $LWHEN
+"
+  done <<EOF
+$(tail -n +2 "$STATE_FILE")
+EOF
 fi
 
 write_state() {
   # write_state <sats> — atomic: tmp file in the same directory + mv. A spend
   # that cannot be recorded must stop the run BEFORE the payment it reserves;
-  # bills already paid this run were recorded before their payment.
+  # bills already paid this run were recorded before their payment. The
+  # paid-txid ledger is carried along on every write.
   local tmp
   tmp="$(mktemp "${STATE_FILE}.XXXXXX")" || {
     echo "state: needs_attention"
     echo "message: cannot write state file"
     exit 5
   }
-  printf '%s %s\n' "$TODAY" "$1" > "$tmp"
+  { printf '%s %s\n' "$TODAY" "$1"; printf '%s' "$PAID_LEDGER"; } > "$tmp"
   mv "$tmp" "$STATE_FILE" || {
     echo "state: needs_attention"
     echo "message: cannot write state file"
@@ -163,7 +211,9 @@ echo "dry_run: $DRY_RUN"
 echo "max_sats_per_bill: $MAX_SATS_PER_BILL"
 echo "daily_budget_sats: $DAILY_BUDGET_SATS"
 [ -n "$AUDIT_PER_RECORD_SATS" ] && echo "audit_per_record_sats: $AUDIT_PER_RECORD_SATS"
+echo "max_records_per_bill: $MAX_RECORDS_PER_BILL"
 echo "spent_today_sats: $SPENT_TODAY"
+echo "paid_ledger_txids: $(echo $PAID_TXIDS | wc -w | tr -d ' ')"
 echo
 
 echo "=== fetch bills ==="
@@ -206,10 +256,13 @@ fi
 # An unpaid bill without a bolt11, or without a payment_hash, has nothing
 # payable this poll and is dropped; a malformed bill or summary fails the
 # whole run (exit 4).
-python3 - "$TMP/bills.json" "$TMP/unpaid.tsv" 2>/dev/null <<'PY'
+python3 - "$TMP/bills.json" "$TMP/unpaid.tsv" "$AUDIT_PER_RECORD_SATS" "$MAX_RECORDS_PER_BILL" 2>/dev/null <<'PY'
 import json, sys
 
-bills_path, tsv_path = sys.argv[1:]
+bills_path, tsv_path, rate_raw, max_records_raw = sys.argv[1:]
+rate = int(rate_raw) if rate_raw else None
+max_records = int(max_records_raw)
+SUPPLY_SATS = 2_100_000_000_000_000
 data = json.load(open(bills_path))
 
 bills = data.get("bills")
@@ -251,8 +304,22 @@ for b in bills:
         continue
     if any(c.isspace() for c in txid + payment_hash + bolt11):
         raise SystemExit(1)
+    # The rate audit and the plausibility bound are decided here, on exact
+    # integers, so the shell never computes on a number the gateway sent.
+    # The verdict reaches the shell as one token plus one detail token.
+    verdict, detail = "ok", "-"
+    if records is not None and records > max_records:
+        verdict, detail = "implausible", "records=%d>max_records_per_bill=%d" % (records, max_records)
+    elif amount > SUPPLY_SATS:
+        verdict, detail = "implausible", "amount=%d>bitcoin_supply" % amount
+    elif rate is not None:
+        if records is None:
+            verdict = "records_missing"
+        elif records < 1 or records * rate != amount:
+            verdict = "rate_mismatch"
+            detail = "records=%d*rate=%d=%d,bill=%d" % (records, rate, records * rate, amount)
     rows.append((txid, str(amount), "-" if records is None else str(records),
-                 payment_hash, bolt11))
+                 payment_hash, bolt11, verdict, detail))
 
 with open(tsv_path, "w") as f:
     for r in rows:
@@ -281,15 +348,36 @@ WOULD_COUNT=0
 WOULD_SATS=0
 SKIPPED_COUNT=0
 AUDIT_SKIPPED=0
+REPLAY_SKIPPED=0
 FAILED_COUNT=0
 ATTEMPTED=""
+ATTEMPTED_TXIDS=""
 
 # Loop input on fd 3 so nothing inside the loop can ever eat bill lines from
 # stdin (the curl helpers read their config from heredocs, not stdin).
-while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 <&3; do
+while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 VERDICT DETAIL <&3; do
   [ -n "$BOLT11" ] || continue
 
-  # Never pay the same invoice twice in one run, whatever the response held.
+  # Never pay an anchor twice, whatever invoice it carries now: a txid in
+  # the paid ledger (any earlier run) is a re-served bill — a gateway
+  # defect or a restored gateway ledger, never a new debt — refused loudly.
+  case " $PAID_TXIDS " in
+    *" $TXID "*)
+      echo "bill $TXID: skipped reason: already_paid_txid (this anchor is in the paid ledger; the bill was re-served with payment_hash $PAYHASH)"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      REPLAY_SKIPPED=$((REPLAY_SKIPPED + 1))
+      continue ;;
+  esac
+
+  # Nor twice in one run — by anchor, whether the response repeated the
+  # invoice or offered a second one for the same txid — nor the same
+  # invoice twice, whatever the response held.
+  case " $ATTEMPTED_TXIDS " in
+    *" $TXID "*)
+      echo "bill $TXID: skipped reason: already_attempted_this_run"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue ;;
+  esac
   case " $ATTEMPTED " in
     *" $PAYHASH "*)
       echo "bill $TXID: skipped reason: already_attempted_this_run"
@@ -297,26 +385,17 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 <&3; do
       continue ;;
   esac
 
-  # Records-rate audit (only when AUDIT_PER_RECORD_SATS is set): the gateway
-  # documents amount_sats = records x contracted rate. Runs before any
-  # phoenixd contact for the bill; a failing bill flags needs_attention but
-  # never aborts the run.
-  if [ -n "$AUDIT_PER_RECORD_SATS" ]; then
-    case "$RECORDS" in
-      ''|-)
-        echo "bill $TXID: skipped reason: records_missing"
-        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-        AUDIT_SKIPPED=$((AUDIT_SKIPPED + 1))
-        continue ;;
-    esac
-    EXPECTED=$((RECORDS * AUDIT_PER_RECORD_SATS))
-    if [ "$RECORDS" -lt 1 ] || [ "$CLAIMED" -ne "$EXPECTED" ]; then
-      echo "bill $TXID: skipped reason: rate_mismatch (records $RECORDS x rate $AUDIT_PER_RECORD_SATS sat = $EXPECTED sat, bill claims $CLAIMED sat)"
+  # Records-rate audit and plausibility bound, decided in exact integer
+  # arithmetic by the validator above. Runs before any phoenixd contact for
+  # the bill; a failing bill flags needs_attention but never aborts the run.
+  case "$VERDICT" in
+    ok) ;;
+    *)
+      echo "bill $TXID: skipped reason: $VERDICT ($DETAIL)"
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       AUDIT_SKIPPED=$((AUDIT_SKIPPED + 1))
-      continue
-    fi
-  fi
+      continue ;;
+  esac
 
   AMT="$(decode_amount_sats "$BOLT11")"
   case "$AMT" in
@@ -325,6 +404,15 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 <&3; do
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue ;;
   esac
+  # The decoded amount is the only gateway-sent number the shell computes
+  # with: bound it before any comparison, so nothing beyond 64 bits can
+  # slip past a comparison that fails open.
+  if [ "${#AMT}" -gt 16 ]; then
+    echo "bill $TXID: skipped reason: implausible (decoded_amount_exceeds_16_digits)"
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    AUDIT_SKIPPED=$((AUDIT_SKIPPED + 1))
+    continue
+  fi
 
   if [ "$AMT" != "$CLAIMED" ]; then
     echo "bill $TXID: skipped reason: amount_mismatch (invoice $AMT sat, bill $CLAIMED sat)"
@@ -346,6 +434,7 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 <&3; do
   fi
 
   ATTEMPTED="$ATTEMPTED $PAYHASH"
+  ATTEMPTED_TXIDS="$ATTEMPTED_TXIDS $TXID"
 
   if [ "$DRY_RUN" = "true" ]; then
     echo "bill $TXID: would_pay $AMT sat"
@@ -365,6 +454,12 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 <&3; do
     echo "bill $TXID: paid $AMT sat"
     PAID_COUNT=$((PAID_COUNT + 1))
     PAID_SATS=$((PAID_SATS + AMT))
+    # Into the paid ledger the moment the preimage is in hand, so no later
+    # run can be talked into paying this anchor again.
+    PAID_TXIDS="$PAID_TXIDS $TXID"
+    PAID_LEDGER="${PAID_LEDGER}paid $TXID $AMT $(date -u +%Y-%m-%dT%H:%M:%SZ)
+"
+    write_state "$SPENT_TODAY"
   else
     echo "bill $TXID: payment_failed ($AMT sat reserved against budget)"
     FAILED_COUNT=$((FAILED_COUNT + 1))
@@ -383,11 +478,12 @@ else
   echo "budget_spent_today: $SPENT_TODAY"
 fi
 echo "skipped_count: $SKIPPED_COUNT"
-[ -n "$AUDIT_PER_RECORD_SATS" ] && echo "audit_skipped_count: $AUDIT_SKIPPED"
+echo "audit_skipped_count: $AUDIT_SKIPPED"
+echo "replay_skipped_count: $REPLAY_SKIPPED"
 echo "failed_count: $FAILED_COUNT"
 echo "budget_remaining: $((DAILY_BUDGET_SATS - SPENT_TODAY))"
 
-if [ "$FAILED_COUNT" -gt 0 ] || [ "$AUDIT_SKIPPED" -gt 0 ]; then
+if [ "$FAILED_COUNT" -gt 0 ] || [ "$AUDIT_SKIPPED" -gt 0 ] || [ "$REPLAY_SKIPPED" -gt 0 ]; then
   echo "state: needs_attention"
 elif [ "$DRY_RUN" = "true" ]; then
   echo "state: dry_run_complete"

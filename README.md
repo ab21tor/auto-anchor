@@ -26,9 +26,10 @@ Precedence: invocation env > sourced `.env` beside the script > defaults.
 | `PHOENIXD_URL` | `http://127.0.0.1:9740` | password read from `~/.phoenix/phoenix.conf` |
 | `MAX_SATS_PER_BILL` | 60000 | refuse any single bill above this |
 | `DAILY_BUDGET_SATS` | 200000 | refuse to exceed this per UTC day |
-| `AUDIT_PER_RECORD_SATS` | (unset) | contracted per-record rate; enables the audit below |
+| `AUDIT_PER_RECORD_SATS` | (unset) | contracted per-record rate; enables the rate audit below |
+| `MAX_RECORDS_PER_BILL` | 10000000 | plausibility bound: more records than this, or more sats than exist, is refused as `implausible` |
 | `DRY_RUN` | `true` | strict true/false |
-| `STATE_FILE` | `pay-anchor-bills.state` beside the script | UTC day + sats spent |
+| `STATE_FILE` | `pay-anchor-bills.state` beside the script | UTC day + sats spent, then the paid-txid ledger |
 
 ### Ceilings and sizing
 
@@ -44,22 +45,55 @@ yours.
 ### Audit behaviour
 
 With `AUDIT_PER_RECORD_SATS` set, every unpaid bill must carry an integer
-`records >= 1` and satisfy `amount_sats == records × rate` — checked
-before any phoenixd contact for that bill. A failing bill is skipped
-(`records_missing` | `rate_mismatch`) and the run ends
-`needs_attention`. Unset: no audit. The amount enforced against ceiling
-and budget is the **decoded invoice's**, never the gateway's claimed one
-(fail closed — the pay402 ceiling rule).
+`records >= 1` and satisfy `amount_sats == records × rate`, decided in
+exact integer arithmetic (Python, never the shell) before any phoenixd
+contact for that bill. Independently of the rate, a bill claiming more
+than `MAX_RECORDS_PER_BILL` records, or more sats than exist, is
+`implausible` whatever its arithmetic says. A failing bill is skipped
+(`records_missing` | `rate_mismatch` | `implausible`) and the run ends
+`needs_attention`. Unset rate: no rate audit, the plausibility bound
+stays. The shell never computes on a number the gateway sent: the decoded
+invoice amount is bounded to 16 digits before any comparison, and every
+sats or records knob must fit 16 digits. The amount enforced against
+ceiling and budget is the **decoded invoice's**, never the gateway's
+claimed one (fail closed — the pay402 ceiling rule).
+
+### Never the same anchor twice
+
+The state file carries a paid-txid ledger: one `paid <txid> <sats> <utc>`
+line per anchor this payer has ever paid, written the moment the preimage
+is in hand. A bill whose txid is in the ledger is skipped
+`already_paid_txid`, whatever invoice it carries now — a re-served anchor
+is a gateway defect or a restored gateway ledger, never a new debt — and
+the run ends `needs_attention`. Within one run an anchor is attempted
+once, however many invoices the response offers for it, and an invoice
+is attempted once, however many bills carry it
+(`already_attempted_this_run`). The ledger only grows; a payment that
+failed outright is not in it and is retried next run.
 
 ### Budget and state
 
 The budget counts **attempts**: spend is recorded before each
 `/payinvoice` call and never refunded intra-day — a timeout mid-payment
 may still have paid. Bills are paid oldest-anchor-first so budget goes to
-the oldest debts. The state file holds one line — UTC day and sats spent —
-written atomically; a corrupt state file ends the run `needs_attention`
-and never silently resets the budget to zero. Secrets go to curl via
-stdin config only — never argv, never logged.
+the oldest debts. The state file holds the day line — UTC day and sats
+spent — followed by the paid-txid ledger, written atomically; a corrupt
+state file, or a day line dated after today, ends the run
+`needs_attention` before any fetch and never silently resets the budget
+to zero. Secrets go to curl via stdin config only — never argv, never
+logged.
+
+### Unit tests
+
+```bash
+bash -n pay-anchor-bills.sh
+python3 -m unittest discover -s tests
+```
+
+Stdlib only: a fake gateway and a fake phoenixd on loopback drive the
+script through paying, the replay refusals, the audit and plausibility
+refusals, and the state-file rules. `PAYER_SCRIPT=/path/to/copy` runs the
+same tests against another copy of the script.
 
 ### Running it
 
