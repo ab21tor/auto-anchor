@@ -17,6 +17,7 @@ import json
 import os
 import secrets
 import socket
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -185,6 +186,10 @@ class PayerCase(unittest.TestCase):
         with open(os.path.join(self.home, ".phoenix", "phoenix.conf"), "w") as fd:
             fd.write("http-password=test-password\n")
         self.state = os.path.join(self.tmp.name, "pay-anchor-bills.state")
+        # Run a copy of the script from the temp dir: the script sources a .env beside
+        # itself, and the checkout's own .env (a live payer's) must never reach a test.
+        self.script = os.path.join(self.tmp.name, "pay-anchor-bills.sh")
+        shutil.copyfile(SCRIPT, self.script)
 
     def run_payer(self, dry_run=False, audit=RATE, max_bill=10_000_000, budget=10_000_000, **extra):
         env = {"PATH": os.environ["PATH"], "HOME": self.home, "LANG": "C", "TZ": "UTC",
@@ -195,7 +200,7 @@ class PayerCase(unittest.TestCase):
         if audit is not None:
             env["AUDIT_PER_RECORD_SATS"] = str(audit)
         env.update(extra)
-        p = subprocess.run(["/bin/bash", SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+        p = subprocess.run(["/bin/bash", self.script], env=env, capture_output=True, text=True, timeout=120)
         return p.returncode, p.stdout + p.stderr
 
     def state_lines(self):

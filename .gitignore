@@ -13,5 +13,9 @@ phoenixd-*/
 # Pre-edit copies left beside edited files
 *.bak-*
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # macOS
 .DS_Store
