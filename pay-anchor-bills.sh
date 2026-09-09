@@ -29,6 +29,19 @@
 #                        whatever its arithmetic says, and the run ends
 #                        needs_attention. Size it like the ceilings: records
 #                        per anchor window, with room.
+#   RECORDS_LOG          (optional) path of the api-endpoint data log this
+#                        payer can read (its rotated .1 generation is read
+#                        too). When set, a bill may not claim more records
+#                        than this client's own proof_free + proof_bought
+#                        events between the previous anchor's confirmed_at
+#                        (exclusive) and its own (inclusive), plus slack;
+#                        a bill above that is skipped
+#                        (records_exceed_submissions) and the run ends
+#                        needs_attention. Unset: no records audit (a payer
+#                        that does not run beside the endpoint).
+#   RECORDS_SLACK_PCT    (default 10) slack as a percentage of the window's
+#                        count; RECORDS_SLACK_RECORDS (default 0) an absolute
+#                        floor for it: slack = max(floor, count x pct / 100).
 #   DRY_RUN              (strict true/false, default true)
 #   STATE_FILE           (default pay-anchor-bills.state beside this script)
 #
@@ -46,24 +59,29 @@
 #
 # No arithmetic is done in the shell on a number the gateway sent: the rate
 # audit and the plausibility bound run in Python on exact integers, and the
-# shell compares only amounts it has bounded to 16 digits.
+# shell compares only amounts it has bounded to 16 digits. Nor does a string
+# the gateway sent reach the shell unchecked: a txid or payment_hash that is
+# not 64 lowercase hex, or a bolt11 that is not bech32, is refused per bill
+# (malformed_txid | malformed_payment_hash | malformed_bolt11, the txid shown
+# escaped and bounded) and the run ends needs_attention.
 #
 # Secrets (ANCHOR_BILLS_TOKEN, phoenixd password) go to curl via stdin
 # config only — never argv, never echoed, never logged; curl stderr is
 # discarded because a config parse error can echo the config (secret) back.
 # Error strings are fixed-format and never contain URLs or credentials.
 #
-# Exit nonzero only when the run itself failed: 2 config or unreadable state
-# file, 3 bills fetch, 4 malformed response, 5 state file write. Per-bill
+# Exit nonzero only when the run itself failed: 2 config, unreadable state
+# file or unreadable RECORDS_LOG, 3 bills fetch, 4 malformed response, 5
+# state file write. Per-bill
 # failures report and continue (exit 0, surfaced as state: needs_attention).
 set -u
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Invocation env wins over .env: snapshot before sourcing, because set -a
-# sourcing would silently overwrite an explicit DRY_RUN=false on the
-# command line with a .env default.
+# Invocation env wins over .env: snapshot before sourcing, because sourcing
+# would silently overwrite an explicit DRY_RUN=false on the command line
+# with a .env default.
 ENV_BILLS_URL="${BILLS_URL:-}"
 ENV_ANCHOR_BILLS_TOKEN="${ANCHOR_BILLS_TOKEN:-}"
 ENV_PHOENIXD_URL="${PHOENIXD_URL:-}"
@@ -71,14 +89,17 @@ ENV_MAX_SATS_PER_BILL="${MAX_SATS_PER_BILL:-}"
 ENV_DAILY_BUDGET_SATS="${DAILY_BUDGET_SATS:-}"
 ENV_AUDIT_PER_RECORD_SATS="${AUDIT_PER_RECORD_SATS:-}"
 ENV_MAX_RECORDS_PER_BILL="${MAX_RECORDS_PER_BILL:-}"
+ENV_RECORDS_LOG="${RECORDS_LOG:-}"
+ENV_RECORDS_SLACK_PCT="${RECORDS_SLACK_PCT:-}"
+ENV_RECORDS_SLACK_RECORDS="${RECORDS_SLACK_RECORDS:-}"
 ENV_DRY_RUN="${DRY_RUN:-}"
 ENV_STATE_FILE="${STATE_FILE:-}"
 
+# Sourced as plain shell variables, not exported: nothing from .env (the
+# bearer token above all) reaches the environment of curl or python3.
 if [ -f "$SCRIPT_DIR/.env" ]; then
-  set -a
   # shellcheck disable=SC1091
   . "$SCRIPT_DIR/.env"
-  set +a
 fi
 
 BILLS_URL="${ENV_BILLS_URL:-${BILLS_URL:-}}"
@@ -88,6 +109,9 @@ MAX_SATS_PER_BILL="${ENV_MAX_SATS_PER_BILL:-${MAX_SATS_PER_BILL:-60000}}"
 DAILY_BUDGET_SATS="${ENV_DAILY_BUDGET_SATS:-${DAILY_BUDGET_SATS:-200000}}"
 AUDIT_PER_RECORD_SATS="${ENV_AUDIT_PER_RECORD_SATS:-${AUDIT_PER_RECORD_SATS:-}}"
 MAX_RECORDS_PER_BILL="${ENV_MAX_RECORDS_PER_BILL:-${MAX_RECORDS_PER_BILL:-10000000}}"
+RECORDS_LOG="${ENV_RECORDS_LOG:-${RECORDS_LOG:-}}"
+RECORDS_SLACK_PCT="${ENV_RECORDS_SLACK_PCT:-${RECORDS_SLACK_PCT:-10}}"
+RECORDS_SLACK_RECORDS="${ENV_RECORDS_SLACK_RECORDS:-${RECORDS_SLACK_RECORDS:-0}}"
 DRY_RUN="${ENV_DRY_RUN:-${DRY_RUN:-true}}"
 STATE_FILE="${ENV_STATE_FILE:-${STATE_FILE:-$SCRIPT_DIR/pay-anchor-bills.state}}"
 
@@ -116,10 +140,22 @@ esac
 case "$MAX_RECORDS_PER_BILL" in
   ''|0*|*[!0-9]*) fail_config "MAX_RECORDS_PER_BILL must be a positive integer" ;;
 esac
+# The records audit is opt-in: RECORDS_LOG names the api-endpoint data log
+# this payer can read. Unreadable is a config error, before any fetch.
+if [ -n "$RECORDS_LOG" ]; then
+  [ -f "$RECORDS_LOG" ] && [ -r "$RECORDS_LOG" ] || fail_config "RECORDS_LOG is not a readable file"
+fi
+case "$RECORDS_SLACK_PCT" in
+  ''|*[!0-9]*) fail_config "RECORDS_SLACK_PCT must be a non-negative integer" ;;
+esac
+case "$RECORDS_SLACK_RECORDS" in
+  ''|*[!0-9]*) fail_config "RECORDS_SLACK_RECORDS must be a non-negative integer" ;;
+esac
 # Every knob that reaches shell arithmetic is bounded to 16 digits (above
 # the total bitcoin supply in sats): the shell's integers are 64-bit, and
 # its comparisons fail open on anything larger.
-for KNOB in "$MAX_SATS_PER_BILL" "$DAILY_BUDGET_SATS" "$MAX_RECORDS_PER_BILL" "${AUDIT_PER_RECORD_SATS:-0}"; do
+for KNOB in "$MAX_SATS_PER_BILL" "$DAILY_BUDGET_SATS" "$MAX_RECORDS_PER_BILL" "${AUDIT_PER_RECORD_SATS:-0}" \
+            "$RECORDS_SLACK_PCT" "$RECORDS_SLACK_RECORDS"; do
   [ "${#KNOB}" -le 16 ] || fail_config "a sats or records knob exceeds 16 digits"
 done
 case "$DRY_RUN" in
@@ -183,10 +219,11 @@ write_state() {
 }
 
 decode_amount_sats() {
-  # decode_amount_sats <bolt11> — echoes the invoice amount in sats, empty on
+  # decode_amount_sats <bolt11> — echoes the invoice amount in sats via
+  # decode-amount.py beside this script (shared with pay402), empty on
   # any failure (caller fails closed, the pay402 ceiling rule). The ceiling
   # and budget are enforced on THIS amount, not the gateway's claimed one.
-  curl -sS --max-time 15 --config - 2>/dev/null <<EOF | python3 -c 'import sys,json;d=json.load(sys.stdin);a=d.get("amountSat") or (int(d.get("amount",0))//1000 if d.get("amount") else None) or (int(d.get("amountMsat",0))//1000 if d.get("amountMsat") else None);print(a if a else "")' 2>/dev/null
+  curl -sS --max-time 15 --config - 2>/dev/null <<EOF | python3 "$SCRIPT_DIR/decode-amount.py" 2>/dev/null
 url = "$PHOENIXD_URL/decodeinvoice"
 user = ":$PW"
 data = "invoice=$1"
@@ -212,6 +249,7 @@ echo "max_sats_per_bill: $MAX_SATS_PER_BILL"
 echo "daily_budget_sats: $DAILY_BUDGET_SATS"
 [ -n "$AUDIT_PER_RECORD_SATS" ] && echo "audit_per_record_sats: $AUDIT_PER_RECORD_SATS"
 echo "max_records_per_bill: $MAX_RECORDS_PER_BILL"
+[ -n "$RECORDS_LOG" ] && echo "records_log: $RECORDS_LOG (slack ${RECORDS_SLACK_PCT}%, at least $RECORDS_SLACK_RECORDS)"
 echo "spent_today_sats: $SPENT_TODAY"
 echo "paid_ledger_txids: $(echo $PAID_TXIDS | wc -w | tr -d ' ')"
 echo
@@ -254,16 +292,65 @@ fi
 # Validate the response and emit unpaid payable bills as TSV, preserving the
 # gateway's oldest-anchor-first order so budget goes to the oldest debts.
 # An unpaid bill without a bolt11, or without a payment_hash, has nothing
-# payable this poll and is dropped; a malformed bill or summary fails the
-# whole run (exit 4).
-python3 - "$TMP/bills.json" "$TMP/unpaid.tsv" "$AUDIT_PER_RECORD_SATS" "$MAX_RECORDS_PER_BILL" 2>/dev/null <<'PY'
-import json, sys
+# payable this poll and is dropped; a bill whose txid, payment_hash or
+# bolt11 has the wrong shape is refused on its own (malformed_* verdict);
+# a response whose structure is wrong fails the whole run (exit 4).
+python3 - "$TMP/bills.json" "$TMP/unpaid.tsv" "$AUDIT_PER_RECORD_SATS" "$MAX_RECORDS_PER_BILL" \
+        "$RECORDS_LOG" "$RECORDS_SLACK_PCT" "$RECORDS_SLACK_RECORDS" 2>/dev/null <<'PY'
+import bisect, calendar, json, re, sys
 
-bills_path, tsv_path, rate_raw, max_records_raw = sys.argv[1:]
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+# bech32: lowercase or uppercase, never mixed; ln + hrp/data, bounded.
+BOLT11 = re.compile(r"^(ln[a-z0-9]{20,4096}|LN[A-Z0-9]{20,4096})$")
+
+(bills_path, tsv_path, rate_raw, max_records_raw,
+ records_log, slack_pct_raw, slack_records_raw) = sys.argv[1:]
 rate = int(rate_raw) if rate_raw else None
 max_records = int(max_records_raw)
+slack_pct = int(slack_pct_raw)
+slack_records = int(slack_records_raw)
 SUPPLY_SATS = 2_100_000_000_000_000
 data = json.load(open(bills_path))
+
+
+def record_times(path):
+    """Epoch second of every proof_free / proof_bought line in the
+    api-endpoint data log at path and its rotated generation path.1 —
+    the client's own count of records it submitted. Exit 2 (config) if
+    the log cannot be read: an audit that cannot count refuses to guess."""
+    times = []
+    days = {}
+    for p, required in ((path + ".1", False), (path, True)):
+        try:
+            fd = open(p, "rb")
+        except FileNotFoundError:
+            if required:
+                raise SystemExit(2)
+            continue
+        except OSError:
+            raise SystemExit(2)
+        with fd:
+            for line in fd:
+                parts = line.split(b" ", 2)
+                if len(parts) < 2 or parts[1] not in (b"proof_free", b"proof_bought"):
+                    continue
+                ts = parts[0]
+                if len(ts) != 20:
+                    continue
+                try:
+                    day = ts[:10]
+                    base = days.get(day)
+                    if base is None:
+                        base = calendar.timegm((int(day[:4]), int(day[5:7]), int(day[8:10]), 0, 0, 0))
+                        days[day] = base
+                    times.append(base + int(ts[11:13]) * 3600 + int(ts[14:16]) * 60 + int(ts[17:19]))
+                except ValueError:
+                    continue
+    times.sort()
+    return times
+
+
+submitted = record_times(records_log) if records_log else None
 
 bills = data.get("bills")
 summary = data.get("summary")
@@ -273,6 +360,13 @@ unpaid_count = summary.get("unpaid_count")
 unpaid_sats = summary.get("unpaid_sats")
 if not isinstance(unpaid_count, int) or not isinstance(unpaid_sats, int):
     raise SystemExit(1)
+
+# Every anchor the response knows about, paid or not, bounds a window:
+# a bill's records are audited against the records this client submitted
+# between the previous anchor's confirmed_at and its own.
+anchors = sorted(b["confirmed_at"] for b in bills
+                 if isinstance(b, dict) and isinstance(b.get("confirmed_at"), int)
+                 and not isinstance(b.get("confirmed_at"), bool))
 
 rows = []
 for b in bills:
@@ -302,8 +396,25 @@ for b in bills:
         continue
     if not isinstance(payment_hash, str) or not payment_hash:
         continue
-    if any(c.isspace() for c in txid + payment_hash + bolt11):
-        raise SystemExit(1)
+    # Field shapes, decided here so nothing but a 64-hex txid, a 64-hex
+    # payment_hash and a bech32 bolt11 ever reaches the shell, the state
+    # file or the log. A bill failing a shape is refused on its own
+    # (malformed_txid | malformed_payment_hash | malformed_bolt11) and the
+    # run ends needs_attention; the other bills are still handled. The
+    # label shown for a bad txid is its escaped, bounded repr, never the
+    # raw bytes (an uppercase or control-character txid once entered the
+    # ledger and wedged every later run: full-review D6, 2026-09-08).
+    shape = None
+    if not HEX64.match(txid):
+        shape = ("malformed_txid", "txid is not 64 lowercase hex")
+    elif not HEX64.match(payment_hash):
+        shape = ("malformed_payment_hash", "payment_hash is not 64 lowercase hex")
+    elif not BOLT11.match(bolt11):
+        shape = ("malformed_bolt11", "bolt11 is not a bech32 string")
+    if shape is not None:
+        label = txid if HEX64.match(txid) else ascii(txid)[:80]
+        rows.append((label, "-", "-", "-", "-", shape[0], shape[1]))
+        continue
     # The rate audit and the plausibility bound are decided here, on exact
     # integers, so the shell never computes on a number the gateway sent.
     # The verdict reaches the shell as one token plus one detail token.
@@ -318,6 +429,25 @@ for b in bills:
         elif records < 1 or records * rate != amount:
             verdict = "rate_mismatch"
             detail = "records=%d*rate=%d=%d,bill=%d" % (records, rate, records * rate, amount)
+    if verdict == "ok" and submitted is not None:
+        # The records audit (opt-in, RECORDS_LOG): the box may not bill
+        # more records than this client submitted in the anchor's window,
+        # plus slack for the confirmation-delay offset and resubmissions.
+        confirmed_at = b.get("confirmed_at")
+        if records is None:
+            verdict = "records_missing"
+        elif not isinstance(confirmed_at, int) or isinstance(confirmed_at, bool):
+            verdict = "records_window_unknown"
+        else:
+            earlier = [a for a in anchors if a < confirmed_at]
+            prev = max(earlier) if earlier else None
+            count = bisect.bisect_right(submitted, confirmed_at) - \
+                (bisect.bisect_right(submitted, prev) if prev is not None else 0)
+            slack = max(slack_records, count * slack_pct // 100)
+            if records > count + slack:
+                verdict = "records_exceed_submissions"
+                detail = "records=%d>submitted=%d+slack=%d,window=%s..%d" % (
+                    records, count, slack, "start" if prev is None else prev, confirmed_at)
     rows.append((txid, str(amount), "-" if records is None else str(records),
                  payment_hash, bolt11, verdict, detail))
 
@@ -329,7 +459,12 @@ print("unpaid_count:", unpaid_count)
 print("unpaid_sats:", unpaid_sats)
 print("payable_count:", len(rows))
 PY
-if [ $? -ne 0 ]; then
+VALIDATOR_RC=$?
+if [ "$VALIDATOR_RC" -eq 2 ]; then
+  echo "state: needs_attention"
+  echo "message: RECORDS_LOG unreadable"
+  exit 2
+elif [ "$VALIDATOR_RC" -ne 0 ]; then
   echo "state: needs_attention"
   echo "message: malformed bills response"
   exit 4
@@ -349,6 +484,7 @@ WOULD_SATS=0
 SKIPPED_COUNT=0
 AUDIT_SKIPPED=0
 REPLAY_SKIPPED=0
+MALFORMED_SKIPPED=0
 FAILED_COUNT=0
 ATTEMPTED=""
 ATTEMPTED_TXIDS=""
@@ -357,6 +493,17 @@ ATTEMPTED_TXIDS=""
 # stdin (the curl helpers read their config from heredocs, not stdin).
 while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 VERDICT DETAIL <&3; do
   [ -n "$BOLT11" ] || continue
+
+  # A bill whose txid, payment_hash or bolt11 failed its shape check is
+  # refused here, before the ledger sees its label: nothing but 64-hex and
+  # bech32 strings reach the state file or a phoenixd call.
+  case "$VERDICT" in
+    malformed_*)
+      echo "bill $TXID: skipped reason: $VERDICT ($DETAIL)"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      MALFORMED_SKIPPED=$((MALFORMED_SKIPPED + 1))
+      continue ;;
+  esac
 
   # Never pay an anchor twice, whatever invoice it carries now: a txid in
   # the paid ledger (any earlier run) is a re-served bill — a gateway
@@ -480,10 +627,12 @@ fi
 echo "skipped_count: $SKIPPED_COUNT"
 echo "audit_skipped_count: $AUDIT_SKIPPED"
 echo "replay_skipped_count: $REPLAY_SKIPPED"
+echo "malformed_skipped_count: $MALFORMED_SKIPPED"
 echo "failed_count: $FAILED_COUNT"
 echo "budget_remaining: $((DAILY_BUDGET_SATS - SPENT_TODAY))"
 
-if [ "$FAILED_COUNT" -gt 0 ] || [ "$AUDIT_SKIPPED" -gt 0 ] || [ "$REPLAY_SKIPPED" -gt 0 ]; then
+if [ "$FAILED_COUNT" -gt 0 ] || [ "$AUDIT_SKIPPED" -gt 0 ] || [ "$REPLAY_SKIPPED" -gt 0 ] \
+   || [ "$MALFORMED_SKIPPED" -gt 0 ]; then
   echo "state: needs_attention"
 elif [ "$DRY_RUN" = "true" ]; then
   echo "state: dry_run_complete"

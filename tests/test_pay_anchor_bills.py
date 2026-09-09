@@ -161,9 +161,10 @@ def invoice(amount, h=None):
     return h, "lnfake1%sa%s" % (h, amount)
 
 
-def bill(txid, records, amount, h, bolt11, status="unpaid"):
+def bill(txid, records, amount, h, bolt11, status="unpaid", confirmed_at=None):
     return {"txid": txid, "fee_sats": 100, "commitments": 1, "confirmed_height": 10,
-            "confirmed_at": int(time.time()) - 60, "records": records, "amount_sats": amount,
+            "confirmed_at": int(time.time()) - 60 if confirmed_at is None else confirmed_at,
+            "records": records, "amount_sats": amount,
             "status": status, "payment_hash": h, "bolt11": bolt11, "invoice_created_at": int(time.time())}
 
 
@@ -190,6 +191,9 @@ class PayerCase(unittest.TestCase):
         # itself, and the checkout's own .env (a live payer's) must never reach a test.
         self.script = os.path.join(self.tmp.name, "pay-anchor-bills.sh")
         shutil.copyfile(SCRIPT, self.script)
+        # decode-amount.py lives beside the script (shared with pay402).
+        shutil.copyfile(os.path.join(os.path.dirname(SCRIPT), "decode-amount.py"),
+                        os.path.join(self.tmp.name, "decode-amount.py"))
 
     def run_payer(self, dry_run=False, audit=RATE, max_bill=10_000_000, budget=10_000_000, **extra):
         env = {"PATH": os.environ["PATH"], "HOME": self.home, "LANG": "C", "TZ": "UTC",
@@ -339,6 +343,165 @@ class Test_audit(PayerCase):
         self.assertEqual(rc, 2)
         self.assertIn("exceeds 16 digits", out)
         self.assertEqual(self.gateway.fetches, 0)
+
+
+class Test_malformed_bill_fields(PayerCase):
+    """D6 (2026-09-08): a bill's txid and payment_hash must be 64 lowercase
+    hex, its bolt11 a bech32 string; anything else is refused per bill,
+    never paid, and never reaches the state file or the log raw. Pre-fix
+    the payer paid an uppercase txid and then refused every later run
+    ("state file unreadable"): the review's E-P2."""
+
+    def test_uppercase_txid_is_refused_and_the_next_run_still_works(self):
+        h, inv = invoice(30)
+        upper = secrets.token_hex(32).upper()
+        self.gateway.serve(doc(bill(upper, 10, 30, h, inv)))
+        rc, out = self.run_payer()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("malformed_txid", out)
+        self.assertIn("state: needs_attention", out)
+        self.assertEqual(self.phoenixd.pays, [])
+        self.assertIsNone(self.state_lines())
+        # A later, well-formed bill is paid by the same payer: nothing wedged.
+        h2, inv2 = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h2, inv2)))
+        rc, out = self.run_payer()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.reason(out, txid), "paid 30 sat")
+
+    def test_control_characters_never_reach_the_log_raw(self):
+        h, inv = invoice(30)
+        bad = "x\x1b[31mRED\x1b[0m" + "e" * 40
+        self.gateway.serve(doc(bill(bad, 10, 30, h, inv)))
+        rc, out = self.run_payer()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("\x1b", out)
+        self.assertIn("bill 'x\\x1b[31mRED", out)   # escaped, bounded label
+        self.assertIn("malformed_txid", out)
+        self.assertEqual(self.phoenixd.pays, [])
+
+    def test_payment_hash_and_bolt11_are_validated_too(self):
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h.upper(), inv)))
+        rc, out = self.run_payer()
+        self.assertIn("malformed_payment_hash", out)
+        self.assertEqual(self.phoenixd.pays, [])
+        txid2 = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid2, 10, 30, h, inv + '"; url = "http://evil')))
+        rc, out = self.run_payer()
+        self.assertIn("malformed_bolt11", out)
+        self.assertEqual(self.phoenixd.pays, [])
+        self.assertEqual(self.phoenixd.decodes, [])
+
+
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+class Test_records_audit(PayerCase):
+    """J3 (2026-09-08): with RECORDS_LOG set, a bill's records may not exceed
+    the client's own count of proof_free / proof_bought events in the
+    api-endpoint data log between the previous anchor's confirmed_at and
+    this one's, plus slack. Unset, nothing here runs (the Mac payer)."""
+
+    T0 = 1_800_000_000
+
+    def write_log(self, times, name="log", other=0):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "a") as fd:
+            for i, t in enumerate(times):
+                fd.write("%s %s fp=%064x\n" % (iso(t), "proof_free" if i % 2 else "proof_bought", i))
+            for i in range(other):
+                fd.write("%s upgrade_pass checked=1 anchored=0\n" % iso(times[0] if times else self.T0))
+        return os.path.join(self.tmp.name, "log")
+
+    def run_audit(self, *bills, slack_pct=0, slack_records=0, **extra):
+        self.gateway.serve(doc(*bills))
+        return self.run_payer(RECORDS_LOG=os.path.join(self.tmp.name, "log"),
+                              RECORDS_SLACK_PCT=str(slack_pct), RECORDS_SLACK_RECORDS=str(slack_records),
+                              **extra)
+
+    def test_bill_within_the_window_count_is_paid_above_it_refused(self):
+        t_prev, t_this = self.T0, self.T0 + 3600
+        self.write_log([t_prev + 10 * i for i in range(1, 11)], other=5)   # 10 records in the window
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid, 10, 30, h, inv, confirmed_at=t_this))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.reason(out, txid), "paid 30 sat")
+
+        h2, inv2 = invoice(33)
+        txid2 = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid2, 11, 33, h2, inv2, confirmed_at=t_this))
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.reason(out, txid2).startswith("skipped reason: records_exceed_submissions"), out)
+        self.assertIn("records=11>submitted=10", out)
+        self.assertIn("state: needs_attention", out)
+        self.assertEqual([p[0] for p in self.phoenixd.pays], [h], "only the first bill was paid")
+        self.assertNotIn(h2, self.phoenixd.decodes)
+
+    def test_window_starts_at_the_previous_anchor_and_includes_the_edges(self):
+        t_prev, t_this = self.T0, self.T0 + 3600
+        # 5 before the previous anchor (excluded), one exactly at it (excluded),
+        # 3 inside, one exactly at this anchor (included), 2 after (excluded).
+        self.write_log([t_prev - 100 + i for i in range(5)] + [t_prev] +
+                       [t_prev + 100, t_prev + 200, t_prev + 300] + [t_this] + [t_this + 1, t_this + 50])
+        h0, inv0 = invoice(9)
+        h, inv = invoice(12)
+        prev, txid = secrets.token_hex(32), secrets.token_hex(32)
+        rc, out = self.run_audit(bill(prev, 3, 9, h0, inv0, status="paid", confirmed_at=t_prev),
+                                 bill(txid, 4, 12, h, inv, confirmed_at=t_this))
+        self.assertEqual(self.reason(out, txid), "paid 12 sat", out)
+        h2, inv2 = invoice(15)
+        txid2 = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(prev, 3, 9, h0, inv0, status="paid", confirmed_at=t_prev),
+                                 bill(txid2, 5, 15, h2, inv2, confirmed_at=t_this))
+        self.assertIn("records=5>submitted=4", out)
+
+    def test_slack_percent_and_absolute(self):
+        t_this = self.T0 + 3600
+        self.write_log([self.T0 + i for i in range(1, 101)])   # 100 records, no previous anchor
+        h, inv = invoice(330)
+        txid = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid, 110, 330, h, inv, confirmed_at=t_this), slack_pct=10)
+        self.assertEqual(self.reason(out, txid), "paid 330 sat", out)
+        h2, inv2 = invoice(333)
+        txid2 = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid2, 111, 333, h2, inv2, confirmed_at=t_this), slack_pct=10)
+        self.assertIn("records=111>submitted=100+slack=10", out)
+        h3, inv3 = invoice(345)
+        txid3 = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid3, 115, 345, h3, inv3, confirmed_at=t_this),
+                                 slack_pct=10, slack_records=15)
+        self.assertEqual(self.reason(out, txid3), "paid 345 sat", out)
+
+    def test_rotated_generation_is_counted(self):
+        t_this = self.T0 + 3600
+        self.write_log([self.T0 + i for i in range(1, 4)], name="log.1")
+        self.write_log([self.T0 + 100 + i for i in range(1, 4)])
+        h, inv = invoice(18)
+        txid = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid, 6, 18, h, inv, confirmed_at=t_this))
+        self.assertEqual(self.reason(out, txid), "paid 18 sat", out)
+
+    def test_unreadable_log_is_a_config_error_before_any_fetch(self):
+        h, inv = invoice(30)
+        self.gateway.serve(doc(bill(secrets.token_hex(32), 10, 30, h, inv)))
+        rc, out = self.run_payer(RECORDS_LOG=os.path.join(self.tmp.name, "no-such-log"))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("RECORDS_LOG", out)
+        self.assertEqual(self.gateway.fetches, 0)
+        self.assertEqual(self.phoenixd.pays, [])
+
+    def test_unset_means_no_records_audit(self):
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
+        rc, out = self.run_payer()
+        self.assertEqual(self.reason(out, txid), "paid 30 sat", out)
+        self.assertNotIn("records_log", out)
 
 
 class Test_state_file(PayerCase):

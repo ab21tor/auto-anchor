@@ -28,6 +28,9 @@ Precedence: invocation env > sourced `.env` beside the script > defaults.
 | `DAILY_BUDGET_SATS` | 200000 | refuse to exceed this per UTC day |
 | `AUDIT_PER_RECORD_SATS` | (unset) | contracted per-record rate; enables the rate audit below |
 | `MAX_RECORDS_PER_BILL` | 10000000 | plausibility bound: more records than this, or more sats than exist, is refused as `implausible` |
+| `RECORDS_LOG` | (unset) | path of the api-endpoint data log this payer can read; enables the records audit below |
+| `RECORDS_SLACK_PCT` | 10 | records audit slack, percent of the window's count |
+| `RECORDS_SLACK_RECORDS` | 0 | records audit slack floor, absolute records |
 | `DRY_RUN` | `true` | strict true/false |
 | `STATE_FILE` | `pay-anchor-bills.state` beside the script | UTC day + sats spent, then the paid-txid ledger |
 
@@ -57,6 +60,48 @@ invoice amount is bounded to 16 digits before any comparison, and every
 sats or records knob must fit 16 digits. The amount enforced against
 ceiling and budget is the **decoded invoice's**, never the gateway's
 claimed one (fail closed — the pay402 ceiling rule).
+
+### Records audit (opt-in)
+
+With `RECORDS_LOG` set, every unpaid bill is also checked against this
+client's own record of what it submitted. The count is sourced from the
+api-endpoint's data log (`DATA_DIR/log`, one fixed-format line per event,
+UTC timestamp first): every `proof_free` or `proof_bought` line is one
+record this client received a proof for. The rotated generation `log.1`
+is read too, so size the endpoint's `LOG_CAP_BYTES` to hold at least two
+anchor windows. A bill's window is (previous anchor's `confirmed_at`,
+this anchor's `confirmed_at`] — the previous anchor being the latest one
+in the `/anchor-bills` response with an earlier `confirmed_at`, paid or
+not (paid bills stay in the response for a week); with none visible the
+window starts at the log's beginning, which can only over-count and so
+never refuses wrongly. A bill claiming more `records` than that count
+plus slack — `max(RECORDS_SLACK_RECORDS, count × RECORDS_SLACK_PCT / 100)`,
+room for the confirmation-delay offset between tree close and
+`confirmed_at`, and for resubmissions the calendar counts once more than
+the client did — is skipped `records_exceed_submissions` with the
+arithmetic in the line (`records=N>submitted=M+slack=S,window=A..B`),
+the run ends `needs_attention`, and the other bills are still handled. A
+bill without `records`, or without an integer `confirmed_at`, is refused
+too (`records_missing`, `records_window_unknown`). An unreadable log is
+a config error before any fetch (exit 2): an audit that cannot count
+refuses to guess. Proofs the endpoint refused for carrying the wrong
+digest are not counted — a box that serves them finds its bills refused.
+Unset, nothing here runs: a payer that does not run beside the endpoint
+(the Mac's, paying for the Pi) has no log to read and audits by rate and
+ceilings only.
+
+### Field shapes
+
+Before any of that, each unpaid bill's strings are checked for shape in
+the same Python step: `txid` and `payment_hash` must match
+`^[0-9a-f]{64}$`, `bolt11` must be a bech32 string (`ln…`, one case,
+bounded). A bill failing a check is skipped (`malformed_txid` |
+`malformed_payment_hash` | `malformed_bolt11`) with the offending txid
+shown escaped and truncated, never raw; the other bills are still
+handled and the run ends `needs_attention`. Nothing but a 64-hex txid
+ever reaches the paid ledger, so a gateway cannot poison the state file
+(the pre-fix payer paid an uppercase txid, wrote it, and then refused
+every later run as "state file unreadable").
 
 ### Never the same anchor twice
 
@@ -92,8 +137,9 @@ python3 -m unittest discover -s tests
 
 Stdlib only: a fake gateway and a fake phoenixd on loopback drive the
 script through paying, the replay refusals, the audit and plausibility
-refusals, and the state-file rules. `PAYER_SCRIPT=/path/to/copy` runs the
-same tests against another copy of the script.
+refusals, the field-shape refusals, the records audit, and the state-file rules.
+`PAYER_SCRIPT=/path/to/copy` runs the same tests against another copy of the
+script (its `decode-amount.py` is taken from beside the canonical one).
 
 ### Running it
 
