@@ -5,6 +5,12 @@ gateway's anchor bills, audits every one, and pays only what passes,
 within ceilings. `pay402` is the single-purchase tool: one digest, one L402
 purchase, one proof file.
 
+Both belong to the hosted shape only (a gateway sold across a trust
+boundary). The appliance shape — the calendar alone on one box, the
+adapter in its `CALENDAR_URL` mode — has no bills, no Lightning and no
+payer; it is installed from the opentimestamps-server fork's README, "The
+appliance shape".
+
 ## pay-anchor-bills.sh
 
 The standing payer's half of the gateway's anchor billing. Polls
