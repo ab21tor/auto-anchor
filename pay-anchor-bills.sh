@@ -36,9 +36,12 @@
 #                        events between the previous anchor's confirmed_at
 #                        (exclusive) and its own (inclusive), plus slack;
 #                        a bill above that is skipped
-#                        (records_exceed_submissions) and the run ends
-#                        needs_attention. Unset: no records audit (a payer
-#                        that does not run beside the endpoint).
+#                        (records_count_discrepancy: "count discrepancy,
+#                        review required") and the run ends needs_attention.
+#                        This is anomaly detection: an honest batch can
+#                        trigger it and a discrepancy never pays more.
+#                        Unset: no records audit (a payer that does not run
+#                        beside the endpoint).
 #   RECORDS_SLACK_PCT    (default 10) slack as a percentage of the window's
 #                        count; RECORDS_SLACK_RECORDS (default 0) an absolute
 #                        floor for it: slack = max(floor, count x pct / 100).
@@ -49,13 +52,45 @@
 # before each /payinvoice call and never refunded intra-day — a timeout
 # mid-payment may still have paid (fail closed).
 #
-# The state file is the day line ("<UTC day> <sats spent>") followed by the
-# paid-txid ledger: one "paid <txid> <sats> <utc>" line per anchor this
-# payer has ever paid, appended the moment a preimage is in hand. A bill
-# whose txid is in the ledger is never paid again, whatever invoice it
-# carries now (already_paid_txid): a re-served anchor is a gateway defect or
-# a restored gateway ledger, never a new debt. A day line dated after today,
-# or any other line shape, is corruption and ends the run before any payment.
+# One run at a time: the whole run — read state, fetch, audit, pay, write —
+# holds an exclusive lock on STATE_FILE.lock (flock, held by this shell's
+# fd 9 and released by the kernel when the process dies, however it dies).
+# A second run, scheduled or by hand, exits 6 at once with
+# "another run holds the lock" and touches nothing. Before 2026-09-15 two
+# overlapping runs each read the same state, each reserved the full budget,
+# and the last writer erased the other's paid-ledger line.
+#
+# The state file is the day line ("<UTC day> <sats spent>"), then zero or
+# more "attempting <txid> <payment_hash> <bolt11> <sats> <utc>" lines, then
+# the paid-txid ledger: one "paid <txid> <sats> <utc>" line per anchor this
+# payer has ever paid. Every write goes through atomic-write.py beside this
+# script (temp file, fsync, rename, directory fsync); a write that fails
+# stops the run with exit 5 BEFORE the payment it was recording the
+# reservation for, and the last valid state stays on disk.
+#
+# An "attempting" line is written before the wallet is contacted and names
+# the invoice being paid. It is resolved against the wallet
+# (GET /payments/outgoingbyhash/<payment_hash>), at the start of every run
+# and again right after a payment whose answer was not a valid preimage:
+# a payment the wallet reports succeeded (with a 64-hex preimage whose
+# sha256 is the payment hash) is entered in the paid ledger; one the wallet
+# reports failed, or knows nothing about (204: phoenixd records an outgoing
+# payment before it sends, so no record means it never sent), is dropped
+# and the anchor becomes payable again; anything else — the wallet
+# unreachable, an answer that is neither — stays "attempting", the anchor
+# is skipped payment_unresolved on every run until it resolves, and no
+# replacement invoice for that txid is ever paid meanwhile. A transport
+# failure is never taken as proof that nothing was paid.
+#
+# A payment counts as paid only when /payinvoice answered HTTP 200 with a
+# 64-hex paymentPreimage whose sha256 is the invoice's payment hash (the
+# hash phoenixd decoded from the bolt11, never the gateway's claim alone).
+# Null, absent or malformed preimages go to reconciliation, never to the
+# paid ledger. A bill whose txid is in the ledger is never paid again,
+# whatever invoice it carries now (already_paid_txid): a re-served anchor
+# is a gateway defect or a restored gateway ledger, never a new debt. A
+# day line dated after today, or any other line shape, is corruption and
+# ends the run before any payment.
 #
 # No arithmetic is done in the shell on a number the gateway sent: the rate
 # audit and the plausibility bound run in Python on exact integers, and the
@@ -72,8 +107,8 @@
 #
 # Exit nonzero only when the run itself failed: 2 config, unreadable state
 # file or unreadable RECORDS_LOG, 3 bills fetch, 4 malformed response, 5
-# state file write. Per-bill
-# failures report and continue (exit 0, surfaced as state: needs_attention).
+# state file write, 6 another run holds the lock. Per-bill failures report
+# and continue (exit 0, surfaced as state: needs_attention).
 set -u
 umask 077
 
@@ -166,12 +201,30 @@ esac
 PW=$(sed -n 's/^http-password=//p' "$HOME/.phoenix/phoenix.conf" | head -1)
 [ -n "$PW" ] || fail_config "no http-password in ~/.phoenix/phoenix.conf"
 
+# The run lock, taken before the state file is read. fd 9 stays open in
+# this shell for the rest of the run; python only places the flock on the
+# open file description fd 9 refers to, which this shell keeps, so the lock
+# outlives the python process and dies with this one.
+LOCK_FILE="${STATE_FILE}.lock"
+exec 9>>"$LOCK_FILE" || fail_config "cannot open lock file"
+if ! python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)'; then
+  echo "state: needs_attention"
+  echo "message: another run holds the lock"
+  exit 6
+fi
+
 # Day spend so far. Only an absent/empty file or a well-formed line is
 # acceptable: a corrupt file must not silently reset the budget to zero.
 TODAY="$(date -u +%Y-%m-%d)"
 SPENT_TODAY=0
 PAID_LEDGER=""
 PAID_TXIDS=""
+ATTEMPTING_LEDGER=""
+ATTEMPTING_LINES=""
 if [ -s "$STATE_FILE" ]; then
   read -r STATE_DAY STATE_SPENT < "$STATE_FILE"
   case "$STATE_DAY" in
@@ -186,44 +239,53 @@ if [ -s "$STATE_FILE" ]; then
   # with or the clock moved, and the budget must not silently restart.
   [ "$STATE_DAY" \> "$TODAY" ] && fail_config "state file dated in the future"
   [ "$STATE_DAY" = "$TODAY" ] && SPENT_TODAY="$STATE_SPENT"
-  # Every later line is the paid-txid ledger. Any other shape is corruption.
-  while IFS=' ' read -r KIND LTXID LSATS LWHEN; do
+  # Every later line is an attempting line or the paid-txid ledger. Any
+  # other shape is corruption.
+  while IFS=' ' read -r KIND LTXID LSATS LWHEN LEXTRA LEXTRA2; do
     [ -n "$KIND" ] || continue
-    [ "$KIND" = "paid" ] || fail_config "state file unreadable"
-    case "$LTXID" in ''|*[!0-9a-f]*) fail_config "state file unreadable" ;; esac
-    PAID_TXIDS="$PAID_TXIDS $LTXID"
-    PAID_LEDGER="${PAID_LEDGER}paid $LTXID $LSATS $LWHEN
+    case "$KIND" in
+      paid)
+        case "$LTXID" in ''|*[!0-9a-f]*) fail_config "state file unreadable" ;; esac
+        PAID_TXIDS="$PAID_TXIDS $LTXID"
+        PAID_LEDGER="${PAID_LEDGER}paid $LTXID $LSATS $LWHEN
 "
+        ;;
+      attempting)
+        # attempting <txid> <payment_hash> <bolt11> <sats> <utc>
+        case "$LTXID" in ''|*[!0-9a-f]*) fail_config "state file unreadable" ;; esac
+        case "$LSATS" in ''|*[!0-9a-f]*) fail_config "state file unreadable" ;; esac
+        [ -n "$LWHEN" ] && [ -n "$LEXTRA" ] || fail_config "state file unreadable"
+        ATTEMPTING_LINES="${ATTEMPTING_LINES}$LTXID $LSATS $LWHEN $LEXTRA ${LEXTRA2:-}
+"
+        ;;
+      *) fail_config "state file unreadable" ;;
+    esac
   done <<EOF
 $(tail -n +2 "$STATE_FILE")
 EOF
 fi
 
 write_state() {
-  # write_state <sats> — atomic: tmp file in the same directory + mv. A spend
-  # that cannot be recorded must stop the run BEFORE the payment it reserves;
-  # bills already paid this run were recorded before their payment. The
-  # paid-txid ledger is carried along on every write.
-  local tmp
-  tmp="$(mktemp "${STATE_FILE}.XXXXXX")" || {
+  # write_state <sats> — the day line, the attempting lines, then the paid
+  # ledger, through atomic-write.py: temp file in the same directory,
+  # fsync, rename over the state file, directory fsync. A write that fails
+  # stops the run (exit 5) BEFORE the payment whose reservation it was
+  # recording; the state file on disk is then the last one written.
+  if ! { printf '%s %s\n' "$TODAY" "$1"; printf '%s' "$ATTEMPTING_LEDGER"; printf '%s' "$PAID_LEDGER"; } \
+       | python3 "$SCRIPT_DIR/atomic-write.py" "$STATE_FILE" 2>/dev/null; then
     echo "state: needs_attention"
     echo "message: cannot write state file"
     exit 5
-  }
-  { printf '%s %s\n' "$TODAY" "$1"; printf '%s' "$PAID_LEDGER"; } > "$tmp"
-  mv "$tmp" "$STATE_FILE" || {
-    echo "state: needs_attention"
-    echo "message: cannot write state file"
-    exit 5
-  }
+  fi
 }
 
-decode_amount_sats() {
-  # decode_amount_sats <bolt11> — echoes the invoice amount in sats via
-  # decode-amount.py beside this script (shared with pay402), empty on
-  # any failure (caller fails closed, the pay402 ceiling rule). The ceiling
-  # and budget are enforced on THIS amount, not the gateway's claimed one.
-  curl -sS --max-time 15 --config - 2>/dev/null <<EOF | python3 "$SCRIPT_DIR/decode-amount.py" 2>/dev/null
+decode_invoice() {
+  # decode_invoice <bolt11> — echoes "<sats> <payment_hash>" via
+  # decode-invoice.py beside this script (shared with pay402), empty on any
+  # failure (caller fails closed, the pay402 ceiling rule). The ceiling and
+  # budget are enforced on THIS amount, not the gateway's claimed one, and
+  # the preimage check on THIS hash, not the gateway's claimed one.
+  curl -sS --max-time 15 --config - 2>/dev/null <<EOF | python3 "$SCRIPT_DIR/decode-invoice.py" 2>/dev/null
 url = "$PHOENIXD_URL/decodeinvoice"
 user = ":$PW"
 data = "invoice=$1"
@@ -231,12 +293,99 @@ EOF
 }
 
 pay_invoice() {
-  # pay_invoice <bolt11> — echoes the payment preimage, empty on any failure.
-  curl -sS --max-time 120 --config - 2>/dev/null <<EOF | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("paymentPreimage",""))' 2>/dev/null
+  # pay_invoice <bolt11> <payment_hash> — echoes one of:
+  #   paid <preimage>   HTTP 200, a 64-hex paymentPreimage, sha256 = hash
+  #   failed            HTTP 200 with phoenixd's PaymentFailed shape (a
+  #                     reason and no preimage): the wallet says not sent
+  #   unknown           anything else: transport failure, a non-200, a
+  #                     null or malformed preimage — to be reconciled
+  curl -sS --max-time 120 -w '\n%{http_code}' --config - 2>/dev/null <<EOF | python3 -c '
+import hashlib, json, re, sys
+raw = sys.stdin.read()
+body, _, code = raw.rpartition("\n")
+if code.strip() != "200":
+    print("unknown"); sys.exit()
+try:
+    d = json.loads(body)
+except ValueError:
+    print("unknown"); sys.exit()
+if not isinstance(d, dict):
+    print("unknown"); sys.exit()
+p = d.get("paymentPreimage")
+if isinstance(p, str) and re.fullmatch(r"[0-9a-fA-F]{64}", p) and hashlib.sha256(bytes.fromhex(p)).hexdigest() == sys.argv[1]:
+    print("paid " + p.lower())
+elif p is None and "reason" in d:
+    print("failed")
+else:
+    print("unknown")
+' "$2" 2>/dev/null || echo unknown
 url = "$PHOENIXD_URL/payinvoice"
 user = ":$PW"
 data = "invoice=$1"
 EOF
+}
+
+lookup_payment() {
+  # lookup_payment <payment_hash> — asks the wallet what became of an
+  # attempt (GET /payments/outgoingbyhash/<hash>; phoenixd 0.8.0 and 0.9.1
+  # answer the best record for that hash, 204 when there is none). Echoes:
+  #   paid <preimage>   isPaid true with a 64-hex preimage whose sha256 is
+  #                     the hash
+  #   failed            204 (the wallet never sent it: phoenixd records an
+  #                     outgoing payment before sending), or a completed
+  #                     record that is not paid
+  #   unknown           unreachable, a non-JSON or unexpected answer, or a
+  #                     record still in flight (not completed)
+  curl -sS --max-time 20 -w '\n%{http_code}' --config - 2>/dev/null <<EOF | python3 -c '
+import hashlib, json, re, sys
+raw = sys.stdin.read()
+body, _, code = raw.rpartition("\n")
+code = code.strip()
+if code == "204":
+    print("failed"); sys.exit()
+if code != "200":
+    print("unknown"); sys.exit()
+try:
+    d = json.loads(body)
+except ValueError:
+    print("unknown"); sys.exit()
+if not isinstance(d, dict):
+    print("unknown"); sys.exit()
+p = d.get("preimage")
+if d.get("isPaid") is True and isinstance(p, str) and re.fullmatch(r"[0-9a-fA-F]{64}", p) \
+        and hashlib.sha256(bytes.fromhex(p)).hexdigest() == sys.argv[1]:
+    print("paid " + p.lower())
+elif d.get("isPaid") is False and d.get("completedAt") is not None:
+    print("failed")
+else:
+    print("unknown")
+' "$1" 2>/dev/null || echo unknown
+url = "$PHOENIXD_URL/payments/outgoingbyhash/$1"
+user = ":$PW"
+EOF
+}
+
+record_paid() {
+  # record_paid <txid> <sats> — into the paid ledger the moment a valid
+  # preimage is in hand, so no later run can be talked into paying this
+  # anchor again; the attempting line for it is dropped.
+  PAID_TXIDS="$PAID_TXIDS $1"
+  PAID_LEDGER="${PAID_LEDGER}paid $1 $2 $(date -u +%Y-%m-%dT%H:%M:%SZ)
+"
+  drop_attempting "$1"
+}
+
+drop_attempting() {
+  # drop_attempting <txid> — remove that anchor's attempting line.
+  local kept="" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in "attempting $1 "*) ;; *) kept="${kept}${line}
+" ;; esac
+  done <<EOF
+$ATTEMPTING_LEDGER
+EOF
+  ATTEMPTING_LEDGER="$kept"
 }
 
 TMP="$(mktemp -d)" || fail_config "cannot create temp dir"
@@ -253,6 +402,45 @@ echo "max_records_per_bill: $MAX_RECORDS_PER_BILL"
 echo "spent_today_sats: $SPENT_TODAY"
 echo "paid_ledger_txids: $(echo $PAID_TXIDS | wc -w | tr -d ' ')"
 echo
+
+# Unresolved attempts from earlier runs are settled with the wallet
+# BEFORE any bill is fetched: an anchor still unresolved is skipped below
+# (payment_unresolved) and no replacement invoice for it is paid.
+UNRESOLVED_TXIDS=""
+UNRESOLVED_COUNT=0
+RECONCILED_PAID=0
+RECONCILED_FAILED=0
+if [ -n "$ATTEMPTING_LINES" ]; then
+  echo "=== reconcile attempts ==="
+  while IFS=' ' read -r RTXID RHASH RBOLT11 RSATS RWHEN; do
+    [ -n "$RTXID" ] || continue
+    # The line is carried until it resolves; rebuilt here so the ledger
+    # written below holds exactly the unresolved ones.
+    ATTEMPTING_LEDGER="${ATTEMPTING_LEDGER}attempting $RTXID $RHASH $RBOLT11 $RSATS $RWHEN
+"
+    OUTCOME="$(lookup_payment "$RHASH")"
+    case "$OUTCOME" in
+      "paid "*)
+        echo "attempt $RTXID: paid (wallet holds the preimage; entered in the paid ledger)"
+        record_paid "$RTXID" "$RSATS"
+        RECONCILED_PAID=$((RECONCILED_PAID + 1)) ;;
+      failed)
+        echo "attempt $RTXID: payment_failed (wallet reports no successful payment; the anchor is payable again)"
+        drop_attempting "$RTXID"
+        RECONCILED_FAILED=$((RECONCILED_FAILED + 1)) ;;
+      *)
+        echo "attempt $RTXID: payment_unresolved (the wallet could not say; kept, no replacement invoice will be paid)"
+        UNRESOLVED_TXIDS="$UNRESOLVED_TXIDS $RTXID"
+        UNRESOLVED_COUNT=$((UNRESOLVED_COUNT + 1)) ;;
+    esac
+  done <<EOF
+$ATTEMPTING_LINES
+EOF
+  echo
+  if [ "$DRY_RUN" != "true" ]; then
+    write_state "$SPENT_TODAY"
+  fi
+fi
 
 echo "=== fetch bills ==="
 # After a laptop sleep the tailnet can take seconds to come back, and a
@@ -445,8 +633,13 @@ for b in bills:
                 (bisect.bisect_right(submitted, prev) if prev is not None else 0)
             slack = max(slack_records, count * slack_pct // 100)
             if records > count + slack:
-                verdict = "records_exceed_submissions"
-                detail = "records=%d>submitted=%d+slack=%d,window=%s..%d" % (
+                # Anomaly detection, not proof of membership: the window is
+                # bounded by confirmation times, and an honest batch's
+                # records can lie before its window (README, "The records
+                # audit"). A discrepancy is refused for review; it never
+                # authorises paying more.
+                verdict = "records_count_discrepancy"
+                detail = "count discrepancy, review required; records=%d>submitted=%d+slack=%d,window=%s..%d" % (
                     records, count, slack, "start" if prev is None else prev, confirmed_at)
     rows.append((txid, str(amount), "-" if records is None else str(records),
                  payment_hash, bolt11, verdict, detail))
@@ -516,6 +709,15 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 VERDICT DETAIL <&3; 
       continue ;;
   esac
 
+  # An anchor whose earlier attempt the wallet could not resolve is never
+  # paid again — not this invoice, not a replacement — until it resolves.
+  case " $UNRESOLVED_TXIDS " in
+    *" $TXID "*)
+      echo "bill $TXID: skipped reason: payment_unresolved (an earlier attempt is unresolved at the wallet; no replacement invoice is paid)"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue ;;
+  esac
+
   # Nor twice in one run — by anchor, whether the response repeated the
   # invoice or offered a second one for the same txid — nor the same
   # invoice twice, whatever the response held.
@@ -544,13 +746,28 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 VERDICT DETAIL <&3; 
       continue ;;
   esac
 
-  AMT="$(decode_amount_sats "$BOLT11")"
+  DECODED="$(decode_invoice "$BOLT11")"
+  AMT="${DECODED%% *}"
+  DECODED_HASH="${DECODED#* }"
   case "$AMT" in
     ''|*[!0-9]*)
       echo "bill $TXID: skipped reason: cannot_decode_invoice"
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue ;;
   esac
+  case "$DECODED_HASH" in
+    ''|*[!0-9a-f]*)
+      echo "bill $TXID: skipped reason: cannot_decode_invoice"
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue ;;
+  esac
+  # The invoice's own payment hash is what the preimage is checked
+  # against; a bill whose claimed hash is not the invoice's is refused.
+  if [ "$DECODED_HASH" != "$PAYHASH" ]; then
+    echo "bill $TXID: skipped reason: payment_hash_mismatch (invoice $DECODED_HASH, bill $PAYHASH)"
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    continue
+  fi
   # The decoded amount is the only gateway-sent number the shell computes
   # with: bound it before any comparison, so nothing beyond 64 bits can
   # slip past a comparison that fails open.
@@ -591,26 +808,40 @@ while IFS=$'\t' read -r TXID CLAIMED RECORDS PAYHASH BOLT11 VERDICT DETAIL <&3; 
     continue
   fi
 
-  # Reserve before paying: an attempt with unknown outcome may still have
-  # paid, so it consumes budget and is never refunded intra-day.
+  # Reserve before paying, and record what is being paid: the attempting
+  # line names the anchor, the payment hash and the invoice, so a run that
+  # dies here — or a wallet answer that is lost — is reconciled against
+  # the wallet next time, never paid again on a replacement invoice. An
+  # attempt with unknown outcome may still have paid, so it consumes
+  # budget and is never refunded intra-day.
   SPENT_TODAY=$((SPENT_TODAY + AMT))
+  ATTEMPTING_LEDGER="${ATTEMPTING_LEDGER}attempting $TXID $PAYHASH $BOLT11 $AMT $(date -u +%Y-%m-%dT%H:%M:%SZ)
+"
   write_state "$SPENT_TODAY"
 
-  PREIMAGE="$(pay_invoice "$BOLT11")"
-  if [ -n "$PREIMAGE" ]; then
-    echo "bill $TXID: paid $AMT sat"
-    PAID_COUNT=$((PAID_COUNT + 1))
-    PAID_SATS=$((PAID_SATS + AMT))
-    # Into the paid ledger the moment the preimage is in hand, so no later
-    # run can be talked into paying this anchor again.
-    PAID_TXIDS="$PAID_TXIDS $TXID"
-    PAID_LEDGER="${PAID_LEDGER}paid $TXID $AMT $(date -u +%Y-%m-%dT%H:%M:%SZ)
-"
-    write_state "$SPENT_TODAY"
-  else
-    echo "bill $TXID: payment_failed ($AMT sat reserved against budget)"
-    FAILED_COUNT=$((FAILED_COUNT + 1))
-  fi
+  OUTCOME="$(pay_invoice "$BOLT11" "$PAYHASH")"
+  case "$OUTCOME" in
+    "paid "*) ;;
+    *)
+      # Not a valid preimage: the wallet decides what happened, now.
+      OUTCOME="$(lookup_payment "$PAYHASH")" ;;
+  esac
+  case "$OUTCOME" in
+    "paid "*)
+      echo "bill $TXID: paid $AMT sat"
+      PAID_COUNT=$((PAID_COUNT + 1))
+      PAID_SATS=$((PAID_SATS + AMT))
+      record_paid "$TXID" "$AMT"
+      write_state "$SPENT_TODAY" ;;
+    failed)
+      echo "bill $TXID: payment_failed ($AMT sat reserved against budget)"
+      FAILED_COUNT=$((FAILED_COUNT + 1))
+      drop_attempting "$TXID"
+      write_state "$SPENT_TODAY" ;;
+    *)
+      echo "bill $TXID: payment_unresolved ($AMT sat reserved against budget; the wallet could not say — kept for reconciliation, no replacement invoice will be paid)"
+      UNRESOLVED_COUNT=$((UNRESOLVED_COUNT + 1)) ;;
+  esac
 done 3< "$TMP/unpaid.tsv"
 echo
 
@@ -629,10 +860,13 @@ echo "audit_skipped_count: $AUDIT_SKIPPED"
 echo "replay_skipped_count: $REPLAY_SKIPPED"
 echo "malformed_skipped_count: $MALFORMED_SKIPPED"
 echo "failed_count: $FAILED_COUNT"
+echo "unresolved_count: $UNRESOLVED_COUNT"
+echo "reconciled_paid_count: $RECONCILED_PAID"
+echo "reconciled_failed_count: $RECONCILED_FAILED"
 echo "budget_remaining: $((DAILY_BUDGET_SATS - SPENT_TODAY))"
 
 if [ "$FAILED_COUNT" -gt 0 ] || [ "$AUDIT_SKIPPED" -gt 0 ] || [ "$REPLAY_SKIPPED" -gt 0 ] \
-   || [ "$MALFORMED_SKIPPED" -gt 0 ]; then
+   || [ "$MALFORMED_SKIPPED" -gt 0 ] || [ "$UNRESOLVED_COUNT" -gt 0 ]; then
   echo "state: needs_attention"
 elif [ "$DRY_RUN" = "true" ]; then
   echo "state: dry_run_complete"

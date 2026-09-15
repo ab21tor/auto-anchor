@@ -13,6 +13,8 @@ PAYER_SCRIPT=/path/to/another/pay-anchor-bills.sh runs the same tests
 against that copy (how the fixes were shown red before they were made).
 """
 import base64
+import sys
+import hashlib
 import json
 import os
 import secrets
@@ -85,17 +87,35 @@ class Gateway:
         self.srv.shutdown()
 
 
+PREIMAGES = {}   # payment hash -> preimage, filled by invoice(); the fake wallet's secret
+
+
 class Phoenixd:
-    """decodeinvoice echoes the amount the invoice string claims; payinvoice
-    hands out a preimage once per hash, records every attempt, and can be
-    told to fail the next call."""
+    """decodeinvoice echoes the amount the invoice string claims (and the
+    invoice's payment hash); payinvoice hands out the preimage once per
+    hash, records every attempt, and can be told to fail the next call
+    (fail_next: a 500 with no payment made), to answer a null preimage
+    (null_next: paid, but the answer carries no preimage), or to drop the
+    connection (drop_next: paid, the answer lost — a transport failure
+    after the money moved; drop_unsent_next: the same drop with NO payment
+    made). GET /payments/outgoingbyhash answers as phoenixd 0.8.0 does:
+    the best record for the hash, or 204 when it has none; lookup_down
+    makes it answer 500 instead (the wallet not answering), hold_pays
+    blocks every payinvoice until the event is set (for the lock test)."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.pays = []
         self.decodes = []
         self.paid = set()
+        self.failed = set()
+        self.lookups = []
         self.fail_next = 0
+        self.null_next = 0
+        self.drop_next = 0
+        self.drop_unsent_next = 0
+        self.lookup_down = False
+        self.hold_pays = None
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -105,12 +125,34 @@ class Phoenixd:
                 pass
 
             def _send(self, status, obj):
-                body = json.dumps(obj).encode()
+                body = json.dumps(obj).encode() if obj is not None else b""
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                if obj is not None:
+                    self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                if body:
+                    self.wfile.write(body)
+
+            def do_GET(self):
+                path = urlparse(self.path).path
+                prefix = "/payments/outgoingbyhash/"
+                if path.startswith(prefix):
+                    h = path[len(prefix):]
+                    with outer.lock:
+                        outer.lookups.append(h)
+                        if outer.lookup_down:
+                            self._send(500, {"reason": "injected lookup failure"})
+                        elif h in outer.paid:
+                            self._send(200, {"paymentHash": h, "preimage": PREIMAGES[h], "isPaid": True,
+                                             "completedAt": 1, "sent": 1})
+                        elif h in outer.failed:
+                            self._send(200, {"paymentHash": h, "preimage": None, "isPaid": False,
+                                             "completedAt": 1, "sent": 0})
+                        else:
+                            self._send(204, None)
+                    return
+                self._send(404, {"reason": "no such path"})
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
@@ -119,6 +161,8 @@ class Phoenixd:
                 rest = inv[len("lnfake1"):]
                 h, amount = rest[:64], rest[65:]          # lnfake1<64 hex>a<sats>
                 path = urlparse(self.path).path
+                if path == "/payinvoice" and outer.hold_pays is not None:
+                    outer.hold_pays.wait(30)
                 with outer.lock:
                     if path == "/decodeinvoice":
                         outer.decodes.append(h)
@@ -130,16 +174,34 @@ class Phoenixd:
                     if path == "/payinvoice":
                         if outer.fail_next > 0:
                             outer.fail_next -= 1
+                            outer.failed.add(h)
                             outer.pays.append((h, int(amount) if amount.isdigit() else None, "failed"))
                             self._send(500, {"reason": "injected failure"})
+                            return
+                        if outer.drop_unsent_next > 0:
+                            outer.drop_unsent_next -= 1
+                            outer.pays.append((h, int(amount), "dropped_unsent"))
+                            self.close_connection = True
+                            self.wfile.close()
                             return
                         if h in outer.paid:
                             outer.pays.append((h, int(amount), "refused_already_paid"))
                             self._send(400, {"reason": "invoice already paid"})
                             return
                         outer.paid.add(h)
+                        if outer.null_next > 0:
+                            outer.null_next -= 1
+                            outer.pays.append((h, int(amount), "paid_null_answer"))
+                            self._send(200, {"paymentPreimage": None, "paymentHash": h})
+                            return
+                        if outer.drop_next > 0:
+                            outer.drop_next -= 1
+                            outer.pays.append((h, int(amount), "paid_answer_lost"))
+                            self.close_connection = True
+                            self.wfile.close()
+                            return
                         outer.pays.append((h, int(amount), "paid"))
-                        self._send(200, {"paymentPreimage": secrets.token_hex(32), "paymentHash": h})
+                        self._send(200, {"paymentPreimage": PREIMAGES[h], "paymentHash": h})
                         return
                     self._send(404, {"reason": "no such path"})
 
@@ -150,14 +212,17 @@ class Phoenixd:
 
     def paid_attempts(self):
         with self.lock:
-            return [p for p in self.pays if p[2] == "paid"]
+            return [p for p in self.pays if p[2].startswith("paid")]
 
     def stop(self):
         self.srv.shutdown()
 
 
 def invoice(amount, h=None):
-    h = h or secrets.token_hex(32)
+    if h is None:
+        preimage = secrets.token_hex(32)
+        h = hashlib.sha256(bytes.fromhex(preimage)).hexdigest()
+        PREIMAGES[h] = preimage
     return h, "lnfake1%sa%s" % (h, amount)
 
 
@@ -191,9 +256,10 @@ class PayerCase(unittest.TestCase):
         # itself, and the checkout's own .env (a live payer's) must never reach a test.
         self.script = os.path.join(self.tmp.name, "pay-anchor-bills.sh")
         shutil.copyfile(SCRIPT, self.script)
-        # decode-amount.py lives beside the script (shared with pay402).
-        shutil.copyfile(os.path.join(os.path.dirname(SCRIPT), "decode-amount.py"),
-                        os.path.join(self.tmp.name, "decode-amount.py"))
+        # The helpers live beside the script (shared with pay402).
+        for helper in ("decode-amount.py", "decode-invoice.py", "atomic-write.py", "check-proof.py"):
+            shutil.copyfile(os.path.join(os.path.dirname(SCRIPT), helper),
+                            os.path.join(self.tmp.name, helper))
 
     def run_payer(self, dry_run=False, audit=RATE, max_bill=10_000_000, budget=10_000_000, **extra):
         env = {"PATH": os.environ["PATH"], "HOME": self.home, "LANG": "C", "TZ": "UTC",
@@ -436,7 +502,7 @@ class Test_records_audit(PayerCase):
         txid2 = secrets.token_hex(32)
         rc, out = self.run_audit(bill(txid2, 11, 33, h2, inv2, confirmed_at=t_this))
         self.assertEqual(rc, 0, out)
-        self.assertTrue(self.reason(out, txid2).startswith("skipped reason: records_exceed_submissions"), out)
+        self.assertTrue(self.reason(out, txid2).startswith("skipped reason: records_count_discrepancy"), out)
         self.assertIn("records=11>submitted=10", out)
         self.assertIn("state: needs_attention", out)
         self.assertEqual([p[0] for p in self.phoenixd.pays], [h], "only the first bill was paid")
@@ -508,7 +574,7 @@ class Test_records_audit(PayerCase):
         h2, inv2 = invoice(24)
         txid2 = secrets.token_hex(32)
         rc, out = self.run_audit(bill(txid2, 8, 24, h2, inv2, confirmed_at=t_this))
-        self.assertTrue(self.reason(out, txid2).startswith("skipped reason: records_exceed_submissions"), out)
+        self.assertTrue(self.reason(out, txid2).startswith("skipped reason: records_count_discrepancy"), out)
         self.assertIn("records=8>submitted=7", out)
 
     def test_unreadable_log_is_a_config_error_before_any_fetch(self):
@@ -557,8 +623,11 @@ class Test_state_file(PayerCase):
         self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
         self.phoenixd.fail_next = 1
         rc, out = self.run_payer()
+        # The 500 is not a preimage, so the wallet is asked; it reports the
+        # attempt failed: payment_failed, the attempting line dropped.
         self.assertTrue(self.reason(out, txid).startswith("payment_failed"), out)
         self.assertEqual(self.state_lines(), ["%s 30" % TODAY])   # budget reserved, nothing paid
+        self.assertEqual(self.phoenixd.lookups, [h])
         rc, out = self.run_payer()
         self.assertEqual(self.reason(out, txid), "paid 30 sat")
         self.assertEqual(self.state_lines()[0], "%s 60" % TODAY)  # attempts count
@@ -567,3 +636,336 @@ class Test_state_file(PayerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Test_review_2026_09_15(PayerCase):
+    """The 2026-09-15 independent review's payer findings, as regressions.
+    Each test here fails against 72fb826 and passes now. A killed or
+    overlapping process and injected write failures are what these tests
+    do; a power cut is not simulated and nothing here claims power-loss
+    durability."""
+
+    def test_a_second_concurrent_run_is_refused_by_the_lock(self):
+        # Run A holds the lock while its payment is held open at the
+        # wallet; run B, started meanwhile, exits 6 at once and pays
+        # nothing; A finishes and the state holds one paid anchor.
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
+        self.phoenixd.hold_pays = threading.Event()
+        env_a = dict(PATH=os.environ["PATH"], HOME=self.home, LANG="C", TZ="UTC",
+                     BILLS_URL="http://127.0.0.1:%d/anchor-bills" % self.gateway.port,
+                     ANCHOR_BILLS_TOKEN="test-token", PHOENIXD_URL="http://127.0.0.1:%d" % self.phoenixd.port,
+                     MAX_SATS_PER_BILL="30", DAILY_BUDGET_SATS="30", DRY_RUN="false", STATE_FILE=self.state,
+                     AUDIT_PER_RECORD_SATS=str(RATE))
+        a = subprocess.Popen(["/bin/bash", self.script], env=env_a, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 20
+        while time.time() < deadline and not any(p[2] for p in self.phoenixd.pays):
+            time.sleep(0.05)
+            with self.phoenixd.lock:
+                if self.phoenixd.decodes:
+                    pass
+        # A is inside the wallet call (or about to be); B must be refused.
+        time.sleep(0.3)
+        rc_b, out_b = self.run_payer(max_bill=30, budget=30)
+        self.assertEqual(rc_b, 6, out_b)
+        self.assertIn("another run holds the lock", out_b)
+        self.phoenixd.hold_pays.set()
+        out_a, _ = a.communicate(timeout=30)
+        self.assertEqual(a.returncode, 0, out_a)
+        self.assertEqual(self.reason(out_a, txid), "paid 30 sat")
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+        lines = self.state_lines()
+        self.assertEqual(lines[0], "%s 30" % TODAY)
+        self.assertEqual([l.split(" ")[1] for l in lines[1:]], [txid])
+        # The lock is released with the process: a later run proceeds.
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv, status="paid")))
+        rc, out = self.run_payer()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("state: nothing_due", out)
+
+    def test_a_state_write_that_fails_stops_before_the_payment(self):
+        # The state file's directory is made unwritable after the lock file
+        # exists: the reservation write cannot create its temp file, the
+        # run stops with exit 5, nothing is paid, the old state stands.
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
+        state_dir = os.path.join(self.tmp.name, "state-dir")
+        os.mkdir(state_dir)
+        state = os.path.join(state_dir, "pay-anchor-bills.state")
+        with open(state, "w") as fd:
+            fd.write("%s 0\npaid %s 30 2026-09-01T00:00:00Z\n" % (TODAY, "c" * 64))
+        open(state + ".lock", "a").close()
+        os.chmod(state_dir, 0o500)
+        self.addCleanup(os.chmod, state_dir, 0o700)
+        rc, out = self.run_payer(STATE_FILE=state)
+        self.assertEqual(rc, 5, out)
+        self.assertIn("cannot write state file", out)
+        self.assertEqual(self.phoenixd.pays, [])
+        with open(state) as fd:
+            self.assertEqual(fd.read().splitlines(), ["%s 0" % TODAY, "paid %s 30 2026-09-01T00:00:00Z" % ("c" * 64)])
+        self.assertEqual(sorted(os.listdir(state_dir)), ["pay-anchor-bills.state", "pay-anchor-bills.state.lock"])
+
+    def test_atomic_write_helper_leaves_the_last_valid_file_on_failure(self):
+        helper = os.path.join(os.path.dirname(SCRIPT), "atomic-write.py")
+        dest = os.path.join(self.tmp.name, "target")
+        with open(dest, "w") as fd:
+            fd.write("old\n")
+        p = subprocess.run([sys.executable, helper, dest], input="new\n", text=True, capture_output=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(open(dest).read(), "new\n")
+        os.chmod(self.tmp.name, 0o500)
+        self.addCleanup(os.chmod, self.tmp.name, 0o700)
+        p = subprocess.run([sys.executable, helper, dest], input="newer\n", text=True, capture_output=True)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("atomic-write: failed", p.stderr)
+        self.assertEqual(open(dest).read(), "new\n")
+        os.chmod(self.tmp.name, 0o700)
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if n.startswith("target.")], [])
+
+    def test_a_lost_answer_is_reconciled_with_the_wallet_before_any_replacement_invoice(self):
+        # Run 1: the wallet pays but the answer is lost (connection dropped)
+        # and the wallet's lookup is down too: the attempt stays recorded,
+        # unresolved, needs_attention. Run 2 serves a REPLACEMENT invoice
+        # for the same anchor with the lookup back: the recorded attempt is
+        # found settled, entered as paid, and the replacement is not paid.
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
+        self.phoenixd.drop_next = 1
+        self.phoenixd.lookup_down = True
+        rc, out = self.run_payer(budget=60)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.reason(out, txid).startswith("payment_unresolved"), out)
+        self.assertIn("unresolved_count: 1", out)
+        self.assertIn("state: needs_attention", out)
+        lines = self.state_lines()
+        self.assertEqual(lines[0], "%s 30" % TODAY)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[1].startswith("attempting %s %s %s 30 " % (txid, h, inv)), lines)
+        # Still down: the anchor is skipped, no replacement is paid.
+        h2, inv2 = invoice(30)
+        self.gateway.serve(doc(bill(txid, 10, 30, h2, inv2)))
+        rc, out = self.run_payer(budget=60)
+        self.assertIn("attempt %s: payment_unresolved" % txid, out)
+        self.assertTrue(self.reason(out, txid).startswith("skipped reason: payment_unresolved"), out)
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+        self.assertNotIn(h2, self.phoenixd.decodes)
+        # The wallet answers again: reconciled as paid, the replacement untouched.
+        self.phoenixd.lookup_down = False
+        rc, out = self.run_payer(budget=60)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("attempt %s: paid" % txid, out)
+        self.assertIn("reconciled_paid_count: 1", out)
+        self.assertTrue(self.reason(out, txid).startswith("skipped reason: already_paid_txid"), out)
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+        lines = self.state_lines()
+        self.assertEqual(lines[0], "%s 30" % TODAY)
+        self.assertEqual(lines[1:], ["paid %s 30 %s" % (txid, lines[1].split(" ")[3])])
+
+    def test_a_null_preimage_never_enters_the_paid_ledger(self):
+        # The review's kit: {"paymentPreimage": null}. Before, "None" was a
+        # non-empty string and the anchor was entered as paid. Now the
+        # answer goes to the wallet; with the lookup down it stays an
+        # unresolved attempt, and resolves to paid only from a real preimage.
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
+        self.phoenixd.null_next = 1
+        self.phoenixd.lookup_down = True
+        rc, out = self.run_payer()
+        self.assertTrue(self.reason(out, txid).startswith("payment_unresolved"), out)
+        self.assertNotIn("paid " + txid, "\n".join(self.state_lines()))
+        self.assertIn("attempting " + txid, "\n".join(self.state_lines()))
+        self.phoenixd.lookup_down = False
+        rc, out = self.run_payer()
+        self.assertIn("attempt %s: paid" % txid, out)
+        self.assertIn("paid " + txid, "\n".join(self.state_lines()))
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+
+    def test_a_transport_failure_before_the_wallet_sent_is_a_definite_failure(self):
+        # The connection drops and the wallet never sent: 204 at the lookup
+        # means never attempted, so the anchor is payable again next run.
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv)))
+        self.phoenixd.drop_unsent_next = 1
+        rc, out = self.run_payer()
+        self.assertTrue(self.reason(out, txid).startswith("payment_failed"), out)
+        self.assertEqual(self.state_lines(), ["%s 30" % TODAY])
+        rc, out = self.run_payer()
+        self.assertEqual(self.reason(out, txid), "paid 30 sat")
+        self.assertEqual(self.state_lines()[0], "%s 60" % TODAY)
+
+    def test_a_preimage_that_does_not_hash_to_the_invoice_is_not_a_payment(self):
+        # The gateway's claimed payment_hash must be the invoice's own.
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, "d" * 64, inv)))
+        rc, out = self.run_payer()
+        self.assertTrue(self.reason(out, txid).startswith("skipped reason: payment_hash_mismatch"), out)
+        self.assertEqual(self.phoenixd.pays, [])
+
+    def test_the_records_audit_is_labelled_a_count_discrepancy(self):
+        t_this = self.T0 = 1_800_000_000 + 3600
+        log = os.path.join(self.tmp.name, "log")
+        with open(log, "w") as fd:
+            fd.write("")
+        h, inv = invoice(30)
+        txid = secrets.token_hex(32)
+        self.gateway.serve(doc(bill(txid, 10, 30, h, inv, confirmed_at=t_this)))
+        rc, out = self.run_payer(RECORDS_LOG=log, RECORDS_SLACK_PCT="0")
+        self.assertIn("skipped reason: records_count_discrepancy (count discrepancy, review required; records=10>submitted=0+slack=0,window=start..%d)" % t_this, out)
+        self.assertIn("state: needs_attention", out)
+        self.assertEqual(self.phoenixd.pays, [])
+
+
+# pay402: one purchase, resumable, never a garbage proof.
+PROOF_MAGIC = b'\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94'
+
+
+def pending_proof(digest_hex):
+    uri = b"http://127.0.0.1:14788"
+    payload = bytes([len(uri)]) + uri
+    return PROOF_MAGIC + b"\x01\x08" + bytes.fromhex(digest_hex) + b"\x00" + bytes.fromhex("83dfe30d2ef90c8e") + bytes([len(payload)]) + payload
+
+
+class Pay402Gateway:
+    """A gateway: 402 with an L402 challenge for an unauthenticated
+    /timestamp, and for an authenticated one whatever `redeem` says —
+    ("proof", digest) a real pending proof, ("garbage",) bytes that are not
+    a proof, ("status", 503) an error."""
+
+    def __init__(self, invoice_string):
+        self.invoice_string = invoice_string
+        self.redeem = ("proof",)
+        self.redeems = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode() or "{}")
+                auth = self.headers.get("Authorization", "")
+                if not auth.startswith("L402 "):
+                    self.send_response(402)
+                    self.send_header("WWW-Authenticate", 'L402 macaroon="bWFj", invoice="%s"' % outer.invoice_string)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                outer.redeems.append(auth)
+                kind = outer.redeem[0]
+                if kind == "proof":
+                    data, status = pending_proof(body["digest"]), 200
+                elif kind == "garbage":
+                    data, status = b"not an OTS proof", 200
+                else:
+                    data, status = b'{"detail":"paused"}', outer.redeem[1]
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.port = free_port()
+        self.srv = ThreadingHTTPServer(("127.0.0.1", self.port), H)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.srv.shutdown()
+
+
+class Test_pay402(unittest.TestCase):
+    def setUp(self):
+        self.phoenixd = Phoenixd()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.phoenixd.stop)
+        self.home = os.path.join(self.tmp.name, "home")
+        os.makedirs(os.path.join(self.home, ".phoenix"))
+        with open(os.path.join(self.home, ".phoenix", "phoenix.conf"), "w") as fd:
+            fd.write("http-password=test-password\n")
+        self.h, self.inv = invoice(21)
+        self.gateway = Pay402Gateway(self.inv)
+        self.addCleanup(self.gateway.stop)
+        self.proofs = os.path.join(self.tmp.name, "proofs")
+        self.digest = "ab" * 32
+        self.out = os.path.join(self.proofs, self.digest + ".ots")
+        self.sidecar = os.path.join(self.proofs, self.digest + ".l402")
+        self.script = os.path.join(os.path.dirname(SCRIPT), "pay402")
+
+    def run_pay402(self):
+        env = {"PATH": os.environ["PATH"], "HOME": self.home, "LANG": "C",
+               "GATEWAY_URL": "http://127.0.0.1:%d" % self.gateway.port,
+               "PHOENIXD_URL": "http://127.0.0.1:%d" % self.phoenixd.port, "PROOF_DIR": self.proofs}
+        p = subprocess.run(["/bin/bash", self.script, self.digest], env=env, capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_a_purchase_lands_a_checked_proof_and_clears_its_sidecar(self):
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(open(self.out, "rb").read(), pending_proof(self.digest))
+        self.assertFalse(os.path.exists(self.sidecar))
+        self.assertEqual([n for n in os.listdir(self.proofs)], [self.digest + ".ots"])
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+
+    def test_garbage_is_never_written_as_a_proof(self):
+        self.gateway.redeem = ("garbage",)
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 7, out)
+        self.assertIn("not a proof of this digest", out)
+        self.assertFalse(os.path.exists(self.out))
+        # The paid preimage is on file: a rerun redeems without paying again.
+        self.assertTrue(os.path.exists(self.sidecar))
+        self.assertEqual([n for n in os.listdir(self.proofs)], [self.digest + ".l402"])
+        self.gateway.redeem = ("proof",)
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("resuming: preimage on file", out)
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+        self.assertEqual(open(self.out, "rb").read(), pending_proof(self.digest))
+
+    def test_a_failed_redeem_never_overwrites_an_existing_proof(self):
+        os.makedirs(self.proofs)
+        with open(self.out, "wb") as fd:
+            fd.write(b"prior proof bytes, not valid, to be left alone")
+        self.gateway.redeem = ("status", 503)
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 7, out)
+        self.assertIn("redeem failed (HTTP 503)", out)
+        self.assertEqual(open(self.out, "rb").read(), b"prior proof bytes, not valid, to be left alone")
+
+    def test_an_existing_valid_proof_skips_the_purchase(self):
+        os.makedirs(self.proofs)
+        with open(self.out, "wb") as fd:
+            fd.write(pending_proof(self.digest))
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("already have a valid proof", out)
+        self.assertEqual(self.phoenixd.pays, [])
+        self.assertEqual(self.gateway.redeems, [])
+
+    def test_the_invoice_is_on_file_before_paying_and_a_lost_answer_is_reconciled(self):
+        self.phoenixd.drop_next = 1
+        self.phoenixd.lookup_down = True
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 6, out)
+        self.assertIn("not paying again", out)
+        sidecar = json.load(open(self.sidecar))
+        self.assertEqual((sidecar["invoice"], sidecar["payment_hash"], sidecar["amount_sats"]), (self.inv, self.h, 21))
+        self.assertNotIn("preimage", sidecar)
+        # Rerun with the wallet answering: the preimage is fetched from the
+        # wallet, nothing is paid again, the proof lands.
+        self.phoenixd.lookup_down = False
+        rc, out = self.run_pay402()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("the wallet holds the preimage", out)
+        self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
+        self.assertEqual(open(self.out, "rb").read(), pending_proof(self.digest))

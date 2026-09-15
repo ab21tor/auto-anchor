@@ -3,6 +3,29 @@
 # Usage: pay402 <64-hex-digest>
 # Env: GATEWAY_URL (required), MAX_PRICE_SATS (default 5000),
 #      PHOENIXD_URL (default http://127.0.0.1:9740), PROOF_DIR (default ~/auto-anchor/proofs)
+#
+# One purchase, resumable. The proof lands at PROOF_DIR/<digest>.ots only
+# after the redeem answered 200 and the body checked as one whole
+# OpenTimestamps proof of this digest (check-proof.py beside this script):
+# the body is written to a temporary file first, checked, fsynced, and
+# renamed into place — an existing proof is never overwritten by an error
+# body or by garbage (2026-09-15 review). An existing valid proof skips the
+# purchase altogether.
+#
+# The purchase state lives in PROOF_DIR/<digest>.l402 (macaroon, invoice,
+# payment hash, amount; then the preimage), written through
+# atomic-write.py BEFORE the step it enables: the invoice before paying, the
+# preimage before redeeming. A rerun after a death or a failed redeem picks
+# up there: with a preimage on file it redeems without paying again;
+# with an invoice but no preimage it asks the wallet what became of the
+# payment (GET /payments/outgoingbyhash) and pays only if the wallet knows
+# nothing of it. The sidecar is removed once the proof is on disk.
+#
+# Exit codes: 2 bad digest or missing password, 3 no L402 challenge,
+# 4 amount or payment hash unreadable (refused), 5 quote above the ceiling,
+# 6 payment returned no valid preimage and the wallet could not resolve it
+# (rerun), 7 redeem failed (the sidecar keeps the preimage; rerun), 8 state
+# write failed or purchase state unreadable.
 set -euo pipefail
 
 DIGEST="${1:?usage: pay402 <64-hex sha256 digest>}"
@@ -14,49 +37,200 @@ PHOENIXD_URL="${PHOENIXD_URL:-http://127.0.0.1:9740}"
 PROOF_DIR="${PROOF_DIR:-$HOME/auto-anchor/proofs}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$PROOF_DIR"
+OUT="$PROOF_DIR/$DIGEST.ots"
+SIDECAR="$PROOF_DIR/$DIGEST.l402"
+
+# 0. An existing valid proof: nothing to buy.
+if [ -f "$OUT" ] && python3 "$SCRIPT_DIR/check-proof.py" "$OUT" "$DIGEST" >/dev/null; then
+  echo "already have a valid proof -> $OUT"
+  rm -f "$SIDECAR"
+  exit 0
+fi
 
 PW=$(sed -n 's/^http-password=//p' "$HOME/.phoenix/phoenix.conf" | head -1)
 [ -n "$PW" ] || { echo "pay402: no http-password in ~/.phoenix/phoenix.conf" >&2; exit 2; }
 
-# 1. Challenge
-CH=$(curl -s --max-time 30 -D - -o /dev/null -X POST "$GATEWAY_URL/timestamp" -H 'Content-Type: application/json' -d "{\"digest\":\"$DIGEST\"}")
-AUTH=$(printf '%s' "$CH" | tr -d '\r' | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: L402 //p')
-MACAROON=$(printf '%s' "$AUTH" | sed -n 's/.*macaroon="\([^"]*\)".*/\1/p')
-INVOICE=$(printf '%s' "$AUTH" | sed -n 's/.*invoice="\([^"]*\)".*/\1/p')
-[ -n "$MACAROON" ] && [ -n "$INVOICE" ] || { echo "pay402: no L402 challenge in response" >&2; printf '%s\n' "$CH" >&2; exit 3; }
-# Shape checks before either string reaches a curl config: base64 macaroon,
-# bech32 invoice (one case, never mixed). Nothing else is ever interpolated.
-[[ "$MACAROON" =~ ^[A-Za-z0-9+/=_-]+$ ]] || { echo "pay402: macaroon is not base64 — refusing" >&2; exit 3; }
-[[ "$INVOICE" =~ ^(ln[a-z0-9]+|LN[A-Z0-9]+)$ ]] || { echo "pay402: invoice is not a bech32 string — refusing" >&2; exit 3; }
+sidecar_json() {
+  # sidecar_json <macaroon> <invoice> <hash> <sats> [<preimage>]
+  python3 -c 'import json, sys
+d = {"macaroon": sys.argv[1], "invoice": sys.argv[2], "payment_hash": sys.argv[3], "amount_sats": int(sys.argv[4])}
+if len(sys.argv) > 5 and sys.argv[5]:
+    d["preimage"] = sys.argv[5]
+print(json.dumps(d))' "$@"
+}
 
-# 2. Ceiling — fail closed if the amount can't be read
-AMT=$(curl -s --max-time 15 --config - 2>/dev/null <<EOF | python3 "$SCRIPT_DIR/decode-amount.py" 2>/dev/null
+write_sidecar() {
+  # write_sidecar <json> — atomically; a failed write stops before the step
+  # the record was for.
+  printf '%s\n' "$1" | python3 "$SCRIPT_DIR/atomic-write.py" "$SIDECAR" \
+    || { echo "pay402: cannot write purchase state $SIDECAR" >&2; exit 8; }
+}
+
+sidecar_field() {
+  # sidecar_field <key> — the value as a string, or empty.
+  python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = d.get(sys.argv[2])
+    print(v if isinstance(v, (str, int)) and not isinstance(v, bool) else "")
+except Exception:
+    print("")' "$SIDECAR" "$1" 2>/dev/null
+}
+
+outcome_of() {
+  # outcome_of <payment_hash> <preimage-field> — reads "<body>\n<code>" on
+  # stdin and prints "paid <preimage>" | "failed" | "unknown" (the rules
+  # pay-anchor-bills.sh applies: 204 means the wallet never sent it, a
+  # completed unpaid record is failed, a valid preimage is paid).
+  python3 -c '
+import hashlib, json, re, sys
+raw = sys.stdin.read()
+body, _, code = raw.rpartition("\n")
+code = code.strip()
+if code == "204":
+    print("failed"); sys.exit()
+if code != "200":
+    print("unknown"); sys.exit()
+try:
+    d = json.loads(body)
+except ValueError:
+    print("unknown"); sys.exit()
+if not isinstance(d, dict):
+    print("unknown"); sys.exit()
+p = d.get(sys.argv[2])
+if isinstance(p, str) and re.fullmatch(r"[0-9a-fA-F]{64}", p) and hashlib.sha256(bytes.fromhex(p)).hexdigest() == sys.argv[1]:
+    print("paid " + p.lower())
+elif d.get("isPaid") is False and d.get("completedAt") is not None:
+    print("failed")
+else:
+    print("unknown")
+' "$1" "$2" 2>/dev/null || echo unknown
+}
+
+lookup_payment() {
+  # lookup_payment <payment_hash> — what the wallet says became of it.
+  # `|| true`: under pipefail a transport failure is curl's exit status,
+  # and outcome_of has already printed "unknown" for it.
+  curl -s --max-time 20 -w '\n%{http_code}' --config - 2>/dev/null <<EOF | outcome_of "$1" preimage || true
+url = "$PHOENIXD_URL/payments/outgoingbyhash/$1"
+user = ":$PW"
+EOF
+}
+
+MACAROON=""
+INVOICE=""
+PAYHASH=""
+AMT=""
+PREIMAGE=""
+
+# 0b. Resume from the sidecar, if any.
+if [ -f "$SIDECAR" ]; then
+  MACAROON="$(sidecar_field macaroon)"
+  INVOICE="$(sidecar_field invoice)"
+  PAYHASH="$(sidecar_field payment_hash)"
+  AMT="$(sidecar_field amount_sats)"
+  PREIMAGE="$(sidecar_field preimage)"
+  if [[ "$MACAROON" =~ ^[A-Za-z0-9+/=_-]+$ ]] && [[ "$PAYHASH" =~ ^[0-9a-f]{64}$ ]] && [[ "$AMT" =~ ^[0-9]+$ ]]; then
+    if [[ "$PREIMAGE" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "resuming: preimage on file, redeeming without paying again"
+    else
+      PREIMAGE=""
+      OUTCOME="$(lookup_payment "$PAYHASH")"
+      case "$OUTCOME" in
+        "paid "*)
+          PREIMAGE="${OUTCOME#paid }"
+          echo "resuming: the wallet holds the preimage, redeeming without paying again"
+          write_sidecar "$(sidecar_json "$MACAROON" "$INVOICE" "$PAYHASH" "$AMT" "$PREIMAGE")" ;;
+        failed)
+          echo "resuming: the wallet never sent the recorded payment; starting a fresh purchase"
+          rm -f "$SIDECAR"; MACAROON=""; INVOICE=""; PAYHASH=""; AMT="" ;;
+        *)
+          echo "pay402: an earlier payment for this digest is unresolved at the wallet; not paying again — rerun once the wallet answers" >&2
+          exit 6 ;;
+      esac
+    fi
+  else
+    echo "pay402: purchase state $SIDECAR is unreadable; move it aside to start over" >&2
+    exit 8
+  fi
+fi
+
+if [ -z "$PREIMAGE" ]; then
+  # 1. Challenge
+  CH=$(curl -s --max-time 30 -D - -o /dev/null -X POST "$GATEWAY_URL/timestamp" -H 'Content-Type: application/json' -d "{\"digest\":\"$DIGEST\"}")
+  AUTH=$(printf '%s' "$CH" | tr -d '\r' | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: L402 //p')
+  MACAROON=$(printf '%s' "$AUTH" | sed -n 's/.*macaroon="\([^"]*\)".*/\1/p')
+  INVOICE=$(printf '%s' "$AUTH" | sed -n 's/.*invoice="\([^"]*\)".*/\1/p')
+  [ -n "$MACAROON" ] && [ -n "$INVOICE" ] || { echo "pay402: no L402 challenge in response" >&2; printf '%s\n' "$CH" >&2; exit 3; }
+  # Shape checks before either string reaches a curl config: base64 macaroon,
+  # bech32 invoice (one case, never mixed). Nothing else is ever interpolated.
+  [[ "$MACAROON" =~ ^[A-Za-z0-9+/=_-]+$ ]] || { echo "pay402: macaroon is not base64 — refusing" >&2; exit 3; }
+  [[ "$INVOICE" =~ ^(ln[a-z0-9]+|LN[A-Z0-9]+)$ ]] || { echo "pay402: invoice is not a bech32 string — refusing" >&2; exit 3; }
+
+  # 2. Ceiling — fail closed if the amount or the payment hash can't be read
+  DECODED=$(curl -s --max-time 15 --config - 2>/dev/null <<EOF | python3 "$SCRIPT_DIR/decode-invoice.py" 2>/dev/null
 url = "$PHOENIXD_URL/decodeinvoice"
 user = ":$PW"
 data = "invoice=$INVOICE"
 EOF
 )
-[ -n "$AMT" ] || { echo "pay402: cannot determine invoice amount — refusing to pay (fail closed)" >&2; exit 4; }
-[ "$AMT" -le "$MAX_PRICE_SATS" ] || { echo "pay402: quote ${AMT} sat exceeds ceiling ${MAX_PRICE_SATS} — refusing" >&2; exit 5; }
+  AMT="${DECODED%% *}"
+  PAYHASH="${DECODED#* }"
+  [[ "$AMT" =~ ^[0-9]+$ ]] && [[ "$PAYHASH" =~ ^[0-9a-f]{64}$ ]] || { echo "pay402: cannot determine invoice amount and payment hash — refusing to pay (fail closed)" >&2; exit 4; }
+  [ "$AMT" -le "$MAX_PRICE_SATS" ] || { echo "pay402: quote ${AMT} sat exceeds ceiling ${MAX_PRICE_SATS} — refusing" >&2; exit 5; }
 
-# 3. Pay
-PREIMAGE=$(curl -s --max-time 120 --config - 2>/dev/null <<EOF | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("paymentPreimage",""))'
+  # 3. Persist the purchase, then pay. Success is HTTP 200 with a 64-hex
+  # preimage whose sha256 is the invoice's payment hash; anything else is
+  # put to the wallet before this script gives up on it.
+  write_sidecar "$(sidecar_json "$MACAROON" "$INVOICE" "$PAYHASH" "$AMT")"
+  OUTCOME=$(curl -s --max-time 120 -w '\n%{http_code}' --config - 2>/dev/null <<EOF | outcome_of "$PAYHASH" paymentPreimage || true
 url = "$PHOENIXD_URL/payinvoice"
 user = ":$PW"
 data = "invoice=$INVOICE"
 EOF
 )
-[ -n "$PREIMAGE" ] || { echo "pay402: payment did not return a preimage" >&2; exit 6; }
-[[ "$PREIMAGE" =~ ^[0-9a-f]{64}$ ]] || { echo "pay402: preimage is not 64 hex — refusing to redeem with it" >&2; exit 6; }
+  case "$OUTCOME" in
+    "paid "*) PREIMAGE="${OUTCOME#paid }" ;;
+    *)
+      OUTCOME="$(lookup_payment "$PAYHASH")"
+      case "$OUTCOME" in
+        "paid "*) PREIMAGE="${OUTCOME#paid }" ;;
+        failed) echo "pay402: payment failed (the wallet reports nothing sent); rerun to try again" >&2; rm -f "$SIDECAR"; exit 6 ;;
+        *) echo "pay402: payment did not return a valid preimage and the wallet could not resolve it; not paying again — rerun once the wallet answers" >&2; exit 6 ;;
+      esac ;;
+  esac
+  write_sidecar "$(sidecar_json "$MACAROON" "$INVOICE" "$PAYHASH" "$AMT" "$PREIMAGE")"
+fi
 
-# 4. Redeem
-OUT="$PROOF_DIR/$DIGEST.ots"
-CODE=$(curl -s --max-time 60 -o "$OUT" -w '%{http_code}' --config - 2>/dev/null <<EOF
+# 4. Redeem into a temporary file; only a checked proof becomes <digest>.ots.
+TMP_OUT="$(mktemp "$OUT.XXXXXX")" || { echo "pay402: cannot create temporary file in $PROOF_DIR" >&2; exit 7; }
+trap 'rm -f "$TMP_OUT"' EXIT
+CODE=$(curl -s --max-time 60 -o "$TMP_OUT" -w '%{http_code}' --config - 2>/dev/null <<EOF
 url = "$GATEWAY_URL/timestamp"
 header = "Content-Type: application/json"
 header = "Authorization: L402 $MACAROON:$PREIMAGE"
 data = "{\"digest\":\"$DIGEST\"}"
 EOF
-)
-[ "$CODE" = "200" ] && [ -s "$OUT" ] || { echo "pay402: redeem failed (HTTP $CODE)" >&2; exit 7; }
-echo "paid ${AMT} sat -> $OUT"
+) || CODE="000"
+if [ "$CODE" != "200" ]; then
+  echo "pay402: redeem failed (HTTP $CODE); the paid preimage is kept in $SIDECAR — rerun to redeem" >&2
+  exit 7
+fi
+if ! REASON="$(python3 "$SCRIPT_DIR/check-proof.py" "$TMP_OUT" "$DIGEST")"; then
+  echo "pay402: redeem answered 200 but the body is not a proof of this digest ($REASON); nothing written — rerun to redeem" >&2
+  exit 7
+fi
+python3 -c '
+import os, sys
+tmp, out = sys.argv[1], sys.argv[2]
+fd = os.open(tmp, os.O_RDONLY)
+os.fsync(fd)
+os.close(fd)
+os.replace(tmp, out)
+dfd = os.open(os.path.dirname(out) or ".", os.O_RDONLY)
+os.fsync(dfd)
+os.close(dfd)
+' "$TMP_OUT" "$OUT" || { echo "pay402: cannot place the proof at $OUT" >&2; exit 7; }
+trap - EXIT
+rm -f "$SIDECAR"
+echo "paid ${AMT:-?} sat -> $OUT"
