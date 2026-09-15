@@ -402,7 +402,7 @@ def iso(t):
 
 class Test_records_audit(PayerCase):
     """J3 (2026-09-08): with RECORDS_LOG set, a bill's records may not exceed
-    the client's own count of proof_free / proof_bought events in the
+    the client's own count of proof_free / bought events in the
     api-endpoint data log between the previous anchor's confirmed_at and
     this one's, plus slack. Unset, nothing here runs (the Mac payer)."""
 
@@ -412,7 +412,7 @@ class Test_records_audit(PayerCase):
         path = os.path.join(self.tmp.name, name)
         with open(path, "a") as fd:
             for i, t in enumerate(times):
-                fd.write("%s %s fp=%064x\n" % (iso(t), "proof_free" if i % 2 else "proof_bought", i))
+                fd.write("%s %s fp=%064x\n" % (iso(t), "proof_free" if i % 2 else "bought", i))
             for i in range(other):
                 fd.write("%s upgrade_pass checked=1 anchored=0\n" % iso(times[0] if times else self.T0))
         return os.path.join(self.tmp.name, "log")
@@ -485,6 +485,31 @@ class Test_records_audit(PayerCase):
         txid = secrets.token_hex(32)
         rc, out = self.run_audit(bill(txid, 6, 18, h, inv, confirmed_at=t_this))
         self.assertEqual(self.reason(out, txid), "paid 18 sat", out)
+
+    def test_paid_door_proofs_are_counted_by_the_adapters_event_name(self):
+        """The adapter logs a free-door proof as proof_free and a paid-door
+        proof as bought (api_endpoint.py); both are records the calendar
+        counted. already_bought, anchored and received are not proofs of a
+        submission and are not counted."""
+        t_this = self.T0 + 3600
+        path = os.path.join(self.tmp.name, "log")
+        with open(path, "a") as fd:
+            for i in range(1, 5):
+                fd.write("%s proof_free fp=%064x\n" % (iso(self.T0 + i), i))
+            for i in range(5, 8):
+                fd.write("%s bought fp=%064x sats=5\n" % (iso(self.T0 + i), i))
+            fd.write("%s already_bought fp=%064x\n" % (iso(self.T0 + 8), 8))
+            fd.write("%s anchored fp=%064x\n" % (iso(self.T0 + 9), 9))
+            fd.write("%s received fp=%064x new_debt=true\n" % (iso(self.T0 + 10), 10))
+        h, inv = invoice(21)
+        txid = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid, 7, 21, h, inv, confirmed_at=t_this))
+        self.assertEqual(self.reason(out, txid), "paid 21 sat", out)   # 4 free + 3 bought
+        h2, inv2 = invoice(24)
+        txid2 = secrets.token_hex(32)
+        rc, out = self.run_audit(bill(txid2, 8, 24, h2, inv2, confirmed_at=t_this))
+        self.assertTrue(self.reason(out, txid2).startswith("skipped reason: records_exceed_submissions"), out)
+        self.assertIn("records=8>submitted=7", out)
 
     def test_unreadable_log_is_a_config_error_before_any_fetch(self):
         h, inv = invoice(30)

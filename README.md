@@ -103,10 +103,11 @@ bound stays.
 checked against this client's own record of what it submitted. The count
 is sourced from the `api-endpoint` adapter's data log (`DATA_DIR/log`,
 one fixed-format line per event, UTC timestamp first): every `proof_free`
-or `proof_bought` line is one record; the adapter's paid-door event,
-written as `bought`, is not counted. The rotated generation `log.1` is read too, so the adapter's
-`LOG_CAP_BYTES` must hold at least two anchor windows. A bill's window is
-(previous anchor's `confirmed_at`, this anchor's `confirmed_at`], the
+or `bought` line, the adapter's free-door and paid-door proof events, is
+one record this client received a proof for. The rotated generation
+`log.1` is read too, so the adapter's `LOG_CAP_BYTES` must hold at least
+two anchor windows. A bill's window is (previous anchor's
+`confirmed_at`, this anchor's `confirmed_at`], the
 previous anchor being the latest one in the `/anchor-bills` response with
 an earlier `confirmed_at`, paid or not (paid bills stay in the response
 for a week); with none visible the window starts at the log's beginning,

@@ -32,7 +32,7 @@
 #   RECORDS_LOG          (optional) path of the api-endpoint data log this
 #                        payer can read (its rotated .1 generation is read
 #                        too). When set, a bill may not claim more records
-#                        than this client's own proof_free + proof_bought
+#                        than this client's own proof_free + bought
 #                        events between the previous anchor's confirmed_at
 #                        (exclusive) and its own (inclusive), plus slack;
 #                        a bill above that is skipped
@@ -314,7 +314,7 @@ data = json.load(open(bills_path))
 
 
 def record_times(path):
-    """Epoch second of every proof_free / proof_bought line in the
+    """Epoch second of every proof_free / bought line in the
     api-endpoint data log at path and its rotated generation path.1 —
     the client's own count of records it submitted. Exit 2 (config) if
     the log cannot be read: an audit that cannot count refuses to guess."""
@@ -332,7 +332,7 @@ def record_times(path):
         with fd:
             for line in fd:
                 parts = line.split(b" ", 2)
-                if len(parts) < 2 or parts[1] not in (b"proof_free", b"proof_bought"):
+                if len(parts) < 2 or parts[1] not in (b"proof_free", b"bought"):
                     continue
                 ts = parts[0]
                 if len(ts) != 20:
