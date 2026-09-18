@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """atomic-write.py DEST < content
 
-Write stdin to DEST atomically and durably, or fail without touching DEST:
-a temporary file in DEST's directory, fsynced; renamed over DEST; the
-directory fsynced. Any failure (a full disk, a permission, a short write)
-removes the temporary file, leaves the last valid DEST in place, prints one
-fixed-format line to stderr and exits 1. Shared by pay-anchor-bills.sh
-(its state file) and pay402 (its sidecar).
+Write stdin to DEST by checked write: a temporary file in DEST's
+directory, fsynced; renamed over DEST; the directory fsynced. What a
+failure leaves depends on where it happens. Before the rename (a full
+disk, a permission, a short write): the temporary file is removed and the
+old DEST stands. At the directory fsync, after the rename: the new DEST is
+visible, its durability is not known, and the old DEST is gone. Either way
+one fixed-format line goes to stderr and the exit status is 1; the caller
+decides what a failed write means for the file it now sees. The helper
+does not promise that the old DEST survives every failure (2026-09-18
+gate, ruling 1: the text here used to say so, which the code never did).
+Used by pay402 for its purchase record; the standing payer that shared it
+was retired.
 
 A checked write is what this establishes; a power cut is not simulated
 and no test here claims power-loss durability."""

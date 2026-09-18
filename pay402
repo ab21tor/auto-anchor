@@ -4,28 +4,44 @@
 # Env: GATEWAY_URL (required), MAX_PRICE_SATS (default 5000),
 #      PHOENIXD_URL (default http://127.0.0.1:9740), PROOF_DIR (default ~/auto-anchor/proofs)
 #
-# One purchase, resumable. The proof lands at PROOF_DIR/<digest>.ots only
-# after the redeem answered 200 and the body checked as one whole
-# OpenTimestamps proof of this digest (check-proof.py beside this script):
-# the body is written to a temporary file first, checked, fsynced, and
-# renamed into place — an existing proof is never overwritten by an error
-# body or by garbage (2026-09-15 review). An existing valid proof skips the
-# purchase altogether.
+# One purchase, resumable, one process per digest. The proof is complete
+# at PROOF_DIR/<digest>.ots only after the redeem answered 200, the body
+# checked as one whole OpenTimestamps proof of this digest (check-proof.py
+# beside this script), the bytes fsynced, the file renamed into place and
+# its directory fsynced. The body goes to a temporary file first, so an
+# existing proof is never overwritten by an error body or by garbage
+# (2026-09-15 review); a proof that is visible but whose directory fsync
+# did not return is not yet complete (2026-09-18 gate, ruling 1).
 #
 # The purchase state lives in PROOF_DIR/<digest>.l402 (macaroon, invoice,
 # payment hash, amount; then the preimage), written through
 # atomic-write.py BEFORE the step it enables: the invoice before paying, the
-# preimage before redeeming. A rerun after a death or a failed redeem picks
-# up there: with a preimage on file it redeems without paying again;
-# with an invoice but no preimage it asks the wallet what became of the
-# payment (GET /payments/outgoingbyhash) and pays only if the wallet knows
-# nothing of it. The sidecar is removed once the proof is on disk.
+# preimage before redeeming. It owns the purchase until the proof is
+# complete. A rerun after a death or a failed redeem picks up there: with a
+# preimage on file it redeems without paying again; with an invoice but no
+# preimage it asks the wallet what became of the payment (GET
+# /payments/outgoingbyhash) and pays only if the wallet knows nothing of
+# it; beside a visible valid proof it fsyncs the proof and its directory
+# first and removes the sidecar after.
+#
+# One process per digest: fd 9 holds an flock on PROOF_DIR/<digest>.lock
+# for the whole run, taken before anything is read; a second pay402 for the
+# same digest exits 9 at once (2026-09-15/16 review F05: two starts bought
+# one digest twice). The lock file is left in place; removing it would race
+# the next start.
+#
+# The wallet password goes to curl by stdin config, never argv. The
+# macaroon and the preimage go to the helper that writes the sidecar by
+# stdin too (2026-09-18 gate, ruling 8): nothing a stranger could redeem
+# with is readable in the process list.
 #
 # Exit codes: 2 bad digest or missing password, 3 no L402 challenge,
 # 4 amount or payment hash unreadable (refused), 5 quote above the ceiling,
 # 6 payment returned no valid preimage and the wallet could not resolve it
-# (rerun), 7 redeem failed (the sidecar keeps the preimage; rerun), 8 state
-# write failed or purchase state unreadable.
+# (rerun), 7 redeem failed, the body was not a proof, or the proof could
+# not be placed or synced (the sidecar is kept; rerun), 8 state write
+# failed or purchase state unreadable, 9 another pay402 holds the lock for
+# this digest.
 set -euo pipefail
 
 DIGEST="${1:?usage: pay402 <64-hex sha256 digest>}"
@@ -39,9 +55,42 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$PROOF_DIR"
 OUT="$PROOF_DIR/$DIGEST.ots"
 SIDECAR="$PROOF_DIR/$DIGEST.l402"
+LOCK="$PROOF_DIR/$DIGEST.lock"
 
-# 0. An existing valid proof: nothing to buy.
+# The run lock, before anything is read. fd 9 stays open in this shell for
+# the rest of the run; python only places the flock on the open file
+# description fd 9 refers to, which this shell keeps, so the lock outlives
+# the python process and dies with this one.
+exec 9>>"$LOCK" || { echo "pay402: cannot open the lock file $LOCK" >&2; exit 9; }
+if ! python3 -c 'import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)'; then
+  echo "pay402: another pay402 holds the lock for this digest" >&2
+  exit 9
+fi
+
+sync_proof() {
+  # sync_proof — fsync the proof file and its directory: the completion
+  # boundary. A visible proof is complete only once both have returned.
+  python3 -c 'import os, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY)
+os.fsync(fd)
+os.close(fd)
+dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+os.fsync(dfd)
+os.close(dfd)' "$OUT"
+}
+
+# 0. An existing valid proof: nothing to buy. A visible proof is complete
+# only once its bytes and its directory entry are synced; a run that
+# stopped between the rename and the directory fsync left exactly this:
+# the file visible, the sidecar standing. Re-establish durability first;
+# the sidecar goes after.
 if [ -f "$OUT" ] && python3 "$SCRIPT_DIR/check-proof.py" "$OUT" "$DIGEST" >/dev/null; then
+  sync_proof || { echo "pay402: a valid proof is visible at $OUT but could not be synced; the purchase record is kept — rerun to re-establish it" >&2; exit 7; }
   echo "already have a valid proof -> $OUT"
   rm -f "$SIDECAR"
   exit 0
@@ -51,17 +100,21 @@ PW=$(sed -n 's/^http-password=//p' "$HOME/.phoenix/phoenix.conf" | head -1)
 [ -n "$PW" ] || { echo "pay402: no http-password in ~/.phoenix/phoenix.conf" >&2; exit 2; }
 
 sidecar_json() {
-  # sidecar_json <macaroon> <invoice> <hash> <sats> [<preimage>]
-  python3 -c 'import json, sys
-d = {"macaroon": sys.argv[1], "invoice": sys.argv[2], "payment_hash": sys.argv[3], "amount_sats": int(sys.argv[4])}
-if len(sys.argv) > 5 and sys.argv[5]:
-    d["preimage"] = sys.argv[5]
-print(json.dumps(d))' "$@"
+  # sidecar_json <macaroon> <invoice> <hash> <sats> [<preimage>] — the
+  # fields go to python on stdin, one per line (each is shape-checked
+  # before it gets here and holds no newline), never on argv: a bearer
+  # token and a preimage must not be readable in the process list.
+  printf '%s\n' "$@" | python3 -c 'import json, sys
+f = sys.stdin.read().split("\n")
+d = {"macaroon": f[0], "invoice": f[1], "payment_hash": f[2], "amount_sats": int(f[3])}
+if len(f) > 4 and f[4]:
+    d["preimage"] = f[4]
+print(json.dumps(d))'
 }
 
 write_sidecar() {
-  # write_sidecar <json> — atomically; a failed write stops before the step
-  # the record was for.
+  # write_sidecar <json> — by checked write; a failed write stops before the
+  # step the record was for.
   printf '%s\n' "$1" | python3 "$SCRIPT_DIR/atomic-write.py" "$SIDECAR" \
     || { echo "pay402: cannot write purchase state $SIDECAR" >&2; exit 8; }
 }
@@ -79,9 +132,9 @@ except Exception:
 
 outcome_of() {
   # outcome_of <payment_hash> <preimage-field> — reads "<body>\n<code>" on
-  # stdin and prints "paid <preimage>" | "failed" | "unknown" (the rules
-  # pay-anchor-bills.sh applies: 204 means the wallet never sent it, a
-  # completed unpaid record is failed, a valid preimage is paid).
+  # stdin and prints "paid <preimage>" | "failed" | "unknown": 204 means
+  # the wallet never sent it, a completed unpaid record is failed, a valid
+  # preimage (its sha256 the payment hash) is paid.
   python3 -c '
 import hashlib, json, re, sys
 raw = sys.stdin.read()
@@ -130,7 +183,8 @@ if [ -f "$SIDECAR" ]; then
   PAYHASH="$(sidecar_field payment_hash)"
   AMT="$(sidecar_field amount_sats)"
   PREIMAGE="$(sidecar_field preimage)"
-  if [[ "$MACAROON" =~ ^[A-Za-z0-9+/=_-]+$ ]] && [[ "$PAYHASH" =~ ^[0-9a-f]{64}$ ]] && [[ "$AMT" =~ ^[0-9]+$ ]]; then
+  if [[ "$MACAROON" =~ ^[A-Za-z0-9+/=_-]+$ ]] && [[ "$INVOICE" =~ ^(ln[a-z0-9]+|LN[A-Z0-9]+)$ ]] \
+     && [[ "$PAYHASH" =~ ^[0-9a-f]{64}$ ]] && [[ "$AMT" =~ ^[0-9]+$ ]]; then
     if [[ "$PREIMAGE" =~ ^[0-9a-f]{64}$ ]]; then
       echo "resuming: preimage on file, redeeming without paying again"
     else
@@ -162,8 +216,9 @@ if [ -z "$PREIMAGE" ]; then
   MACAROON=$(printf '%s' "$AUTH" | sed -n 's/.*macaroon="\([^"]*\)".*/\1/p')
   INVOICE=$(printf '%s' "$AUTH" | sed -n 's/.*invoice="\([^"]*\)".*/\1/p')
   [ -n "$MACAROON" ] && [ -n "$INVOICE" ] || { echo "pay402: no L402 challenge in response" >&2; printf '%s\n' "$CH" >&2; exit 3; }
-  # Shape checks before either string reaches a curl config: base64 macaroon,
-  # bech32 invoice (one case, never mixed). Nothing else is ever interpolated.
+  # Shape checks before either string reaches a curl config or the sidecar
+  # helper: base64 macaroon, bech32 invoice (one case, never mixed).
+  # Nothing else is ever interpolated.
   [[ "$MACAROON" =~ ^[A-Za-z0-9+/=_-]+$ ]] || { echo "pay402: macaroon is not base64 — refusing" >&2; exit 3; }
   [[ "$INVOICE" =~ ^(ln[a-z0-9]+|LN[A-Z0-9]+)$ ]] || { echo "pay402: invoice is not a bech32 string — refusing" >&2; exit 3; }
 
@@ -202,7 +257,8 @@ EOF
   write_sidecar "$(sidecar_json "$MACAROON" "$INVOICE" "$PAYHASH" "$AMT" "$PREIMAGE")"
 fi
 
-# 4. Redeem into a temporary file; only a checked proof becomes <digest>.ots.
+# 4. Redeem into a temporary file; only a checked proof becomes <digest>.ots,
+# and it is complete only once the file and its directory are synced.
 TMP_OUT="$(mktemp "$OUT.XXXXXX")" || { echo "pay402: cannot create temporary file in $PROOF_DIR" >&2; exit 7; }
 trap 'rm -f "$TMP_OUT"' EXIT
 CODE=$(curl -s --max-time 60 -o "$TMP_OUT" -w '%{http_code}' --config - 2>/dev/null <<EOF
@@ -220,17 +276,37 @@ if ! REASON="$(python3 "$SCRIPT_DIR/check-proof.py" "$TMP_OUT" "$DIGEST")"; then
   echo "pay402: redeem answered 200 but the body is not a proof of this digest ($REASON); nothing written — rerun to redeem" >&2
   exit 7
 fi
-python3 -c '
-import os, sys
+# Place, then sync. The helper exits 1 for a failure before the rename
+# (nothing is visible) and 2 for a failure at the directory fsync after it
+# (the proof is visible, not known durable, and the sidecar still owns the
+# purchase: the next run's step 0 re-establishes it).
+python3 -c 'import os, sys
 tmp, out = sys.argv[1], sys.argv[2]
-fd = os.open(tmp, os.O_RDONLY)
-os.fsync(fd)
-os.close(fd)
-os.replace(tmp, out)
-dfd = os.open(os.path.dirname(out) or ".", os.O_RDONLY)
-os.fsync(dfd)
-os.close(dfd)
-' "$TMP_OUT" "$OUT" || { echo "pay402: cannot place the proof at $OUT" >&2; exit 7; }
+try:
+    fd = os.open(tmp, os.O_RDONLY)
+    os.fsync(fd)
+    os.close(fd)
+    os.replace(tmp, out)
+except OSError as exc:
+    print("before the rename: %s" % type(exc).__name__, file=sys.stderr)
+    sys.exit(1)
+try:
+    dfd = os.open(os.path.dirname(out) or ".", os.O_RDONLY)
+    os.fsync(dfd)
+    os.close(dfd)
+except OSError as exc:
+    print("at the directory fsync: %s" % type(exc).__name__, file=sys.stderr)
+    sys.exit(2)' "$TMP_OUT" "$OUT" && PLACED=0 || PLACED=$?
+case "$PLACED" in
+  0) ;;
+  2)
+    trap - EXIT
+    echo "pay402: the proof is visible at $OUT but its directory could not be synced: not known durable; the purchase record is kept — rerun to re-establish it" >&2
+    exit 7 ;;
+  *)
+    echo "pay402: cannot place the proof at $OUT; nothing written — rerun to redeem" >&2
+    exit 7 ;;
+esac
 trap - EXIT
 rm -f "$SIDECAR"
 echo "paid ${AMT:-?} sat -> $OUT"
