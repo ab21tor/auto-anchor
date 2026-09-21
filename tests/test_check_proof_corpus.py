@@ -1,11 +1,10 @@
-"""The proof-byte corpus (tests/proof_corpus.py, a byte-identical copy of
-the calendar fork's ops/tests/proof_corpus.py and the adapter's) against
-check-proof.py, and against the public client where it is importable.
-Of the three claims a reader can make, check-proof.py makes the first,
-"parses", and the corpus pins it; the library's verdict is computed here,
-never assumed. 2026-09-15/16 review F03 (payer half): the reader used to
-skip an attestation's payload by its declared length, so an empty bitcoin
-payload passed here and failed the public client."""
+"""The proof-byte corpus (tests/proof_corpus.py, carried from the
+calendar fork's ops/tests/proof_corpus.py) against check-proof.py, and
+against the public client where it is importable. Of the three claims a
+reader can make, check-proof.py makes the first, "parses", and the corpus
+pins it; the library's verdict is computed here, never assumed. A reader
+that skipped an attestation's payload by its declared length would pass
+an empty bitcoin payload that the public client refuses."""
 import importlib.util
 import io
 import os
@@ -30,9 +29,9 @@ try:
     from opentimestamps.core.notary import BitcoinBlockHeaderAttestation, PendingAttestation
     from opentimestamps.core.serialize import StreamDeserializationContext
     from opentimestamps.core.timestamp import DetachedTimestampFile
-    LIBRARY = True
+    HAVE_LIBRARY = True
 except ImportError:      # the payer host need not have it
-    LIBRARY = False
+    HAVE_LIBRARY = False
 
 
 def reader_verdict(data):
@@ -86,7 +85,7 @@ class Test_corpus_against_the_reader(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(reader_verdict(data)[0], "invalid")
 
-    def test_the_two_review_cases_are_refused_by_the_command(self):
+    def test_an_empty_bitcoin_payload_and_a_trailing_byte_are_refused_by_the_command(self):
         cases = dict((name, data) for name, data, _, _, _ in corpus.cases())
         for name, reason in (("bitcoin_payload_empty", "truncated varuint"),
                              ("bitcoin_payload_trailing_byte", "trailing bytes in the bitcoin attestation")):
@@ -119,7 +118,7 @@ class Test_corpus_against_the_reader(unittest.TestCase):
                 pass
 
 
-@unittest.skipUnless(LIBRARY, "opentimestamps is not importable by %s: the oracle comparison did not run" % ORACLE)
+@unittest.skipUnless(HAVE_LIBRARY, "opentimestamps is not importable by %s: the oracle comparison did not run" % ORACLE)
 class Test_corpus_against_the_library(unittest.TestCase):
     """The oracle is the opentimestamps package importable by the
     interpreter running this suite (ORACLE); the suite never depends on

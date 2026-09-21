@@ -4,8 +4,8 @@ stdin — or nothing at all, which every caller treats as "refuse to pay".
 
 Precedence, the same everywhere in this project: amountSat, then amount
 (millisats), then amountMsat. Anything unreadable, missing, non-positive
-or not an integer prints nothing (fail closed). Shared by pay402 and
-pay-anchor-bills.sh (full review N21, 2026-09-08)."""
+or not an integer prints nothing (fail closed). decode-invoice.py imports
+the rule from here."""
 import json
 import sys
 

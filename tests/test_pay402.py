@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import secrets
-import shutil
 import socket
 import subprocess
 import sys
@@ -31,7 +30,6 @@ from urllib.parse import parse_qs, urlparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 SCRIPT = os.path.join(REPO, "pay402")
-HELPERS = ("atomic-write.py", "check-proof.py", "decode-invoice.py", "decode-amount.py")
 
 
 def free_port():
@@ -59,7 +57,6 @@ class Phoenixd:
     def __init__(self):
         self.lock = threading.Lock()
         self.pays = []
-        self.decodes = []
         self.paid = set()
         self.lookups = []
         self.drop_next = 0
@@ -114,7 +111,6 @@ class Phoenixd:
                         outer.hold_pays.wait(30)
                 with outer.lock:
                     if path == "/decodeinvoice":
-                        outer.decodes.append(h)
                         if not inv.startswith("lnfake1") or rest[64:65] != "a" or not amount.isdigit():
                             self._send(400, {"reason": "invalid invoice"})
                             return
@@ -316,7 +312,7 @@ class Pay402Case(unittest.TestCase):
         with open(self.fault_log) as fd:
             return fd.read().splitlines()
 
-    def sidecar_json(self):
+    def read_sidecar(self):
         with open(self.sidecar) as fd:
             return json.load(fd)
 
@@ -376,7 +372,7 @@ class Test_pay402(Pay402Case):
         rc, out = self.run_pay402()
         self.assertEqual(rc, 6, out)
         self.assertIn("not paying again", out)
-        sidecar = self.sidecar_json()
+        sidecar = self.read_sidecar()
         self.assertEqual((sidecar["invoice"], sidecar["payment_hash"], sidecar["amount_sats"]), (self.inv, self.h, 21))
         self.assertNotIn("preimage", sidecar)
         # Rerun with the wallet answering: the preimage is fetched from the
@@ -390,11 +386,11 @@ class Test_pay402(Pay402Case):
 
 
 class Test_completion_boundary(Pay402Case):
-    """2026-09-18 gate, ruling 1: a visible proof is not a completed
-    purchase; the sidecar owns the work until the proof's bytes and its
-    directory entry are synced, on the recovery rerun too. The gate's
-    probe reproduced the defect: an injected directory-fsync failure, then
-    a rerun that deleted the sidecar on sight with no fsync at all."""
+    """A visible proof is not a completed purchase; the sidecar owns the
+    work until the proof's bytes and its directory entry are synced, on
+    the recovery rerun too. Fault model: an injected directory-fsync
+    failure, then a rerun, which must not delete the sidecar on sight
+    with no fsync at all."""
 
     def test_an_injected_fsync_failure_after_the_rename_is_re_established_by_the_rerun(self):
         # Run 1: the directory fsync after the rename raises. The script
@@ -462,10 +458,10 @@ class Test_completion_boundary(Pay402Case):
 
 
 class Test_lock(Pay402Case):
-    """2026-09-15/16 review F05: two pay402 processes for one digest bought
-    it twice. One process per digest: the second exits 9 at once."""
+    """Two pay402 processes for one digest must not buy it twice. One
+    process per digest: the second exits 9 at once."""
 
-    fresh_invoices = True   # the review's shape: each challenge is a new invoice
+    fresh_invoices = True   # each challenge is a new invoice: a second payer would pay a second one
 
     def test_a_second_process_for_the_same_digest_is_refused_at_once(self):
         self.phoenixd.hold_pays = threading.Event()
@@ -498,9 +494,9 @@ class Test_lock(Pay402Case):
 
 
 class Test_argv(Pay402Case):
-    """2026-09-18 gate, ruling 8: the wallet password never reaches argv
-    (curl stdin config), and neither may the macaroon or the preimage:
-    both are readable in the process list for the life of a call."""
+    """The wallet password never reaches argv (curl stdin config), and
+    neither may the macaroon or the preimage: both are readable in the
+    process list for the life of a call."""
 
     def test_the_macaroon_the_preimage_and_the_password_never_reach_argv(self):
         wrappers = os.path.join(self.tmp.name, "bin")
@@ -525,7 +521,7 @@ class Test_argv(Pay402Case):
         os.unlink(self.out)
         rc, out = self.run_pay402(PATH=wrappers + os.pathsep + os.environ["PATH"], ARGV_LOG=argv_log)
         self.assertEqual(rc, 7, out)
-        sidecar = self.sidecar_json()
+        sidecar = self.read_sidecar()
         self.assertEqual((sidecar["macaroon"], sidecar["invoice"], sidecar["payment_hash"], sidecar["amount_sats"]),
                          (MACAROON, self.inv, self.h, 21))
         self.assertEqual(sidecar["preimage"], PREIMAGES[self.h])
@@ -540,8 +536,7 @@ class Test_interruptions(Pay402Case):
     """Process death at the two remaining boundaries of a purchase: while
     the wallet holds the payment (the sidecar has the invoice and no
     preimage) and while the gateway holds the redeem (the sidecar has the
-    preimage). Each rerun is interrupted again, then converges. These pin
-    the behaviour the script already had."""
+    preimage). Each rerun is interrupted again, then converges."""
 
     def wait_for(self, predicate, what):
         deadline = time.time() + 20
@@ -560,7 +555,7 @@ class Test_interruptions(Pay402Case):
         out, _ = p.communicate(timeout=60)
         self.assertEqual(p.returncode, -9, out)
         self.assertNotIn("pay402:", out)
-        sidecar = self.sidecar_json()
+        sidecar = self.read_sidecar()
         self.assertEqual(sidecar["payment_hash"], self.h)
         self.assertNotIn("preimage", sidecar)
         self.assertFalse(os.path.exists(self.out))
@@ -574,7 +569,7 @@ class Test_interruptions(Pay402Case):
         self.gateway.hold_redeems.set()
         out, _ = p2.communicate(timeout=60)
         self.assertEqual(p2.returncode, -9, out)
-        self.assertEqual(self.sidecar_json()["preimage"], PREIMAGES[self.h])
+        self.assertEqual(self.read_sidecar()["preimage"], PREIMAGES[self.h])
         self.assertFalse(os.path.exists(self.out))
         self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
         # The third run redeems from the preimage on file; the fourth finds
@@ -599,7 +594,7 @@ class Test_interruptions(Pay402Case):
         out, _ = p.communicate(timeout=60)
         self.assertEqual(p.returncode, -9, out)
         self.assertNotIn("pay402:", out)
-        self.assertEqual(self.sidecar_json()["preimage"], PREIMAGES[self.h])
+        self.assertEqual(self.read_sidecar()["preimage"], PREIMAGES[self.h])
         self.assertFalse(os.path.exists(self.out))
         self.assertEqual(len(self.phoenixd.paid_attempts()), 1)
         # Interrupted again at the same boundary, then converges.
@@ -609,7 +604,7 @@ class Test_interruptions(Pay402Case):
         p2.kill()
         out, _ = p2.communicate(timeout=60)
         self.assertEqual(p2.returncode, -9, out)
-        self.assertEqual(self.sidecar_json()["preimage"], PREIMAGES[self.h])
+        self.assertEqual(self.read_sidecar()["preimage"], PREIMAGES[self.h])
         self.gateway.hold_redeems = None
         rc, out = self.run_pay402()
         self.assertEqual(rc, 0, out)
@@ -621,9 +616,7 @@ class Test_interruptions(Pay402Case):
 
 
 class Test_atomic_write(unittest.TestCase):
-    """The checked write, at its two failure points. Relocated from the
-    retired standing payer's tests and narrowed to what each case
-    exercises (2026-09-18 gate, ruling 1)."""
+    """The checked write, at its two failure points."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -649,8 +642,8 @@ class Test_atomic_write(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(self.tmp.name) if n.startswith("target.")], [])
 
     def test_a_failure_at_the_directory_fsync_after_the_rename_leaves_the_new_destination_visible(self):
-        # A pin of what the code does, not a change: the new bytes are in
-        # place and their durability is uncertain; exit 1 says so.
+        # The new bytes are in place and their durability is uncertain;
+        # exit 1 says so.
         injection = os.path.join(self.tmp.name, "injection")
         os.mkdir(injection)
         with open(os.path.join(injection, "sitecustomize.py"), "w") as fd:

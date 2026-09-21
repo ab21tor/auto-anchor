@@ -14,12 +14,12 @@ a calendar emits (sha256, append, prepend) and a varuint of at most ten
 bytes. Exit 1 with one line on stdout otherwise.
 
 Structural: nothing is replayed or checked against Bitcoin. This is the
-gate between "bytes an HTTP response carried" and "a proof file on disk"
-(2026-09-15 review: pay402 saved a 503 body over an existing proof and
-called any non-empty 200 body a proof; the same review's F03: the payload
-of an attestation was skipped by its declared length, not read, so an
-empty bitcoin payload passed here and failed the public client). The
-format follows the fork's ops/verify_claim.py parser."""
+gate between "bytes an HTTP response carried" and "a proof file on disk":
+an error body, or any non-empty 200 body, is not a proof and is never
+saved over one; and a payload skipped by its declared length instead of
+read would pass what the public client refuses (an empty bitcoin
+payload, a byte after the height). The format follows the fork's
+ops/verify_claim.py parser."""
 import sys
 
 MAGIC = b'\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94'
@@ -100,7 +100,7 @@ def check(data, digest):
     for the bounds, no hash is computed, nothing is replayed. The walk is
     a loop: a timestamp is zero or more fork-marked branches then a last
     branch, and every fork marker promises one more branch after the one
-    it opens ends, so `pending` holds, per open fork, the message length
+    it opens ends, so `open_forks` holds, per fork, the message length
     and operation count the sibling branch resumes with."""
     if data[:len(MAGIC)] != MAGIC:
         raise Bad("not an OpenTimestamps proof")
@@ -117,7 +117,7 @@ def check(data, digest):
         raise Bad("proof is of a different digest")
     pos += 32
     found = []
-    pending = []
+    open_forks = []
     msg_len, ops, after_fork = 32, 0, False
     while True:
         if pos >= len(data):
@@ -127,16 +127,16 @@ def check(data, digest):
         if tag == FORK:
             if after_fork:
                 raise Bad("a fork marker followed by another fork marker")
-            pending.append((msg_len, ops))
+            open_forks.append((msg_len, ops))
             after_fork = True
             continue
         after_fork = False
         if tag == ATTESTATION:
             node, pos = attestation(data, pos)
             found.append(node)
-            if not pending:
+            if not open_forks:
                 break
-            msg_len, ops = pending.pop()
+            msg_len, ops = open_forks.pop()
             continue
         if msg_len > MAX_MSG:
             raise Bad("message longer than %d bytes" % MAX_MSG)

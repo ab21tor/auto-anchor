@@ -6,7 +6,7 @@ The amount follows decode-amount.py's rule (amountSat, then amount in
 millisats, then amountMsat; fail closed on anything else). The payment hash
 must be present and 64 hex (lowercased here): a payer that cannot read the
 invoice's own payment hash cannot check the preimage it is handed, so it
-does not pay. Shared by pay-anchor-bills.sh and pay402 (2026-09-15)."""
+does not pay. Run by pay402."""
 import importlib.util
 import json
 import os

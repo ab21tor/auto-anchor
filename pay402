@@ -9,9 +9,9 @@
 # checked as one whole OpenTimestamps proof of this digest (check-proof.py
 # beside this script), the bytes fsynced, the file renamed into place and
 # its directory fsynced. The body goes to a temporary file first, so an
-# existing proof is never overwritten by an error body or by garbage
-# (2026-09-15 review); a proof that is visible but whose directory fsync
-# did not return is not yet complete (2026-09-18 gate, ruling 1).
+# existing proof is never overwritten by an error body or by garbage; a
+# proof that is visible but whose directory fsync did not return is not
+# yet complete.
 #
 # The purchase state lives in PROOF_DIR/<digest>.l402 (macaroon, invoice,
 # payment hash, amount; then the preimage), written through
@@ -26,14 +26,14 @@
 #
 # One process per digest: fd 9 holds an flock on PROOF_DIR/<digest>.lock
 # for the whole run, taken before anything is read; a second pay402 for the
-# same digest exits 9 at once (2026-09-15/16 review F05: two starts bought
-# one digest twice). The lock file is left in place; removing it would race
-# the next start.
+# same digest exits 9 at once: two starts for one digest would buy it
+# twice. The lock file is left in place; removing it would race the next
+# start.
 #
 # The wallet password goes to curl by stdin config, never argv. The
 # macaroon and the preimage go to the helper that writes the sidecar by
-# stdin too (2026-09-18 gate, ruling 8): nothing a stranger could redeem
-# with is readable in the process list.
+# stdin too: nothing a stranger could redeem with is readable in the
+# process list.
 #
 # Exit codes: 2 bad digest or missing password, 3 no L402 challenge,
 # 4 amount or payment hash unreadable (refused), 5 quote above the ceiling,

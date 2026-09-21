@@ -9,10 +9,8 @@ old DEST stands. At the directory fsync, after the rename: the new DEST is
 visible, its durability is not known, and the old DEST is gone. Either way
 one fixed-format line goes to stderr and the exit status is 1; the caller
 decides what a failed write means for the file it now sees. The helper
-does not promise that the old DEST survives every failure (2026-09-18
-gate, ruling 1: the text here used to say so, which the code never did).
-Used by pay402 for its purchase record; the standing payer that shared it
-was retired.
+does not promise that the old DEST survives every failure. Used by pay402
+for its purchase record.
 
 A checked write is what this establishes; a power cut is not simulated
 and no test here claims power-loss durability."""
